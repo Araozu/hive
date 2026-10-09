@@ -44,7 +44,11 @@ func main() {
 		os.Exit(probeGo(cfg))
 	}
 
-	m := ui.New(cfg)
+	m, err := ui.New(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hive:", err)
+		os.Exit(1)
+	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "hive:", err)

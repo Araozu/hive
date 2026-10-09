@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,13 +17,40 @@ import (
 func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 	key := msg.String()
 
-	// ctrl+c always quits (and stops any follow stream).
-	if key == "ctrl+c" {
-		if m.followCtx != nil {
-			m.followCtx()
-		}
+	// Closing the observer never sends a daemon cancellation command.
+	if key == "ctrl+c" || key == "ctrl+q" {
+		m.stopFollow()
 		*cmds = append(*cmds, tea.Quit)
 		return true
+	}
+	if key == "tab" || key == "shift+tab" {
+		step := 1
+		if key == "shift+tab" {
+			step = TabCount - 1
+		}
+		*cmds = append(*cmds, m.setTab((m.tab+step)%TabCount))
+		return true
+	}
+	if key == "f1" || key == "f2" || key == "f3" {
+		m.focusInput(int(key[1]-'1'), cmds)
+		return true
+	}
+	if (key == "[" || key == "]") && !m.chatBox.Focused() && !m.goPrompt.Focused() {
+		switch m.tab {
+		case TabProviders:
+			m.cycleProviderFocus(cmds)
+			return true
+		case TabTurns:
+			field := 1
+			if m.inspectInput.Focused() {
+				field = 0
+			}
+			m.focusInput(field, cmds)
+			return true
+		case TabChat:
+			m.focusInput(1, cmds)
+			return true
+		}
 	}
 
 	editing := m.isEditing()
@@ -37,9 +65,12 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			if m.tab == TabChat && m.focusField == "input" {
 				text := strings.TrimSpace(m.chatBox.Value())
 				if text != "" {
-					m.chatBox.Reset()
 					*cmds = append(*cmds, m.cmdChatSend(text))
 				}
+				return true
+			}
+			if m.tab == TabChat {
+				m.focusInput(1, cmds)
 				return true
 			}
 			if m.tab == TabGoDirect && m.focusField == "prompt" {
@@ -51,7 +82,11 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 				return true
 			}
 			if m.tab == TabProviders {
-				*cmds = append(*cmds, m.cmdSetKey())
+				if m.focusField == "login" {
+					*cmds = append(*cmds, m.cmdLoginStatus())
+				} else {
+					*cmds = append(*cmds, m.cmdSetKey())
+				}
 				return true
 			}
 			if m.tab == TabArtifacts {
@@ -76,24 +111,68 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 	}
 
 	switch key {
-	case "q", "ctrl+q":
+	case "q":
+		m.stopFollow()
 		*cmds = append(*cmds, tea.Quit)
 		return true
 	case "?", "h":
 		m.showHelp = !m.showHelp
 		return true
 	case "1", "2", "3", "4", "5", "6", "7":
-		m.setTab(int(key[0] - '1'))
-		return true
-	case "tab":
-		m.setTab((m.tab + 1) % TabCount)
-		return true
-	case "shift+tab":
-		m.setTab((m.tab + TabCount - 1) % TabCount)
+		*cmds = append(*cmds, m.setTab(int(key[0]-'1')))
 		return true
 	case "r", "R":
-		*cmds = append(*cmds, m.cmdRefresh())
+		switch m.tab {
+		case TabChat:
+			*cmds = append(*cmds, m.cmdHistory())
+		case TabTurns:
+			*cmds = append(*cmds, m.cmdTurnShow())
+		case TabArtifacts:
+			*cmds = append(*cmds, m.cmdArtifactShow())
+		case TabProviders:
+			*cmds = append(*cmds, func() tea.Msg { return m.cmdProvs() })
+		case TabGoDirect:
+			*cmds = append(*cmds, m.cmdGoModels())
+		default:
+			*cmds = append(*cmds, m.cmdRefresh())
+		}
 		return true
+	case "pgup", "pgdown", "home", "end":
+		var cmd tea.Cmd
+		switch m.tab {
+		case TabChat:
+			if key == "home" {
+				m.chatView.GotoTop()
+			} else if key == "end" {
+				m.chatView.GotoBottom()
+			} else {
+				m.chatView, cmd = m.chatView.Update(msg)
+			}
+		case TabGoDirect:
+			if key == "home" {
+				m.goView.GotoTop()
+			} else if key == "end" {
+				m.goView.GotoBottom()
+			} else {
+				m.goView, cmd = m.goView.Update(msg)
+			}
+		default:
+			m.detailView.SetContent(m.viewTab())
+			if key == "home" {
+				m.detailView.GotoTop()
+			} else if key == "end" {
+				m.detailView.GotoBottom()
+			} else {
+				m.detailView, cmd = m.detailView.Update(msg)
+			}
+		}
+		*cmds = append(*cmds, cmd)
+		return true
+	case "e":
+		if m.tab == TabTurns || m.tab == TabArtifacts || m.tab == TabProviders {
+			m.focusInput(0, cmds)
+			return true
+		}
 	}
 
 	switch m.tab {
@@ -103,11 +182,13 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			if m.sessCursor < len(m.sessions)-1 {
 				m.sessCursor++
 			}
+			m.revealSessionCursor()
 			return true
 		case "k", "up":
 			if m.sessCursor > 0 {
 				m.sessCursor--
 			}
+			m.revealSessionCursor()
 			return true
 		case "enter":
 			*cmds = append(*cmds, m.cmdSessionInspect())
@@ -119,26 +200,17 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 	case TabChat:
 		switch key {
 		case "e":
-			m.focusField = "input"
-			m.chatSession.Blur()
-			m.chatBox.Focus()
+			m.focusInput(1, cmds)
 			return true
 		case "enter":
-			// session-field enter with empty box: focus editor; actual send
-			// happens from the editor. If editor empty and session set, also
-			// allow follow.
-			if m.chatSession.Value() != "" || true {
-				m.focusField = "input"
-				m.chatSession.Blur()
-				m.chatBox.Focus()
-			}
+			m.focusInput(1, cmds)
 			return true
 		case "f":
 			sid := m.chatSession.Value()
 			if sid != "" {
 				m.startFollow(sid, m.chatCursor)
 				m.status = "following " + sid
-				*cmds = append(*cmds, fastTick())
+				*cmds = append(*cmds, m.cmdHistory())
 			}
 			return true
 		}
@@ -162,16 +234,6 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 		case "i", "I":
 			*cmds = append(*cmds, m.cmdToolShow())
 			return true
-		case "[", "]":
-			// toggle focus between turn id and inspect id
-			if m.turnInput.Focused() {
-				m.turnInput.Blur()
-				m.inspectInput.Focus()
-			} else {
-				m.inspectInput.Blur()
-				m.turnInput.Focus()
-			}
-			return true
 		}
 	case TabArtifacts:
 		switch key {
@@ -192,9 +254,6 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			return true
 		case "L":
 			*cmds = append(*cmds, m.cmdLoginStatus())
-			return true
-		case "[", "]":
-			m.cycleProviderFocus()
 			return true
 		}
 	case TabGoDirect:
@@ -217,14 +276,12 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			*cmds = append(*cmds, m.cmdGoModels())
 			return true
 		case "e":
-			m.focusField = "prompt"
-			m.goPrompt.Focus()
+			m.focusInput(0, cmds)
 			return true
 		case "enter":
 			p := strings.TrimSpace(m.goPrompt.Value())
 			if p == "" {
-				m.focusField = "prompt"
-				m.goPrompt.Focus()
+				m.focusInput(0, cmds)
 				return true
 			}
 			*cmds = append(*cmds, m.cmdGoRun(p))
@@ -232,6 +289,16 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 		}
 	}
 	return false
+}
+
+func (m *Model) revealSessionCursor() {
+	m.detailView.SetContent(m.viewSessions())
+	row := m.sessCursor + 1
+	if row < m.detailView.YOffset {
+		m.detailView.SetYOffset(row)
+	} else if row >= m.detailView.YOffset+m.detailView.Height {
+		m.detailView.SetYOffset(row - m.detailView.Height + 1)
+	}
 }
 
 func (m *Model) isEditing() bool {
@@ -253,64 +320,79 @@ func (m *Model) blurAll() {
 	m.loginID.Blur()
 }
 
-func (m *Model) setTab(t int) {
+func (m *Model) setTab(t int) tea.Cmd {
 	m.blurAll()
 	m.tab = t
+	m.detailView.GotoTop()
 	switch t {
 	case TabChat:
 		m.focusField = "chat"
-		m.chatSession.Focus()
+		return m.chatSession.Focus()
 	case TabTurns:
-		m.turnInput.Focus()
+		return m.turnInput.Focus()
 	case TabArtifacts:
-		m.artInput.Focus()
+		return m.artInput.Focus()
 	case TabProviders:
 		m.focusField = "provider"
-		m.keyProvider.Focus()
+		return m.keyProvider.Focus()
 	case TabGoDirect:
 		m.focusField = "list"
 	default:
 		m.focusField = "chat"
 	}
+	return nil
 }
 
-func (m *Model) cycleProviderFocus() {
+func (m *Model) cycleProviderFocus(cmds *[]tea.Cmd) {
 	switch m.focusField {
 	case "provider":
-		m.focusField = "keyval"
-		m.keyProvider.Blur()
-		m.keyValue.Focus()
+		m.focusInput(1, cmds)
 	case "keyval":
-		m.focusField = "login"
-		m.keyValue.Blur()
-		m.loginID.Focus()
+		m.focusInput(2, cmds)
 	default:
-		m.focusField = "provider"
-		m.loginID.Blur()
-		m.keyProvider.Focus()
+		m.focusInput(0, cmds)
 	}
+}
+
+func (m *Model) focusInput(field int, cmds *[]tea.Cmd) {
+	m.blurAll()
+	var cmd tea.Cmd
+	switch m.tab {
+	case TabChat:
+		m.focusField = "chat"
+		if field == 1 {
+			m.focusField = "input"
+			cmd = m.chatBox.Focus()
+		} else {
+			cmd = m.chatSession.Focus()
+		}
+	case TabTurns:
+		if field == 1 {
+			cmd = m.inspectInput.Focus()
+		} else {
+			cmd = m.turnInput.Focus()
+		}
+	case TabArtifacts:
+		cmd = m.artInput.Focus()
+	case TabProviders:
+		switch field {
+		case 1:
+			m.focusField, cmd = "keyval", m.keyValue.Focus()
+		case 2:
+			m.focusField, cmd = "login", m.loginID.Focus()
+		default:
+			m.focusField, cmd = "provider", m.keyProvider.Focus()
+		}
+	case TabGoDirect:
+		m.focusField, cmd = "prompt", m.goPrompt.Focus()
+	}
+	*cmds = append(*cmds, cmd)
 }
 
 // ---- refresh ----
 
 func (m Model) cmdRefresh() tea.Cmd {
 	return func() tea.Msg { return m.cmdHealth() }
-}
-
-// refreshAll loads every read-only surface (used by headless smoke too).
-func (m Model) cmdRefreshAll() tea.Cmd {
-	return func() tea.Msg { return m.cmdHealth() }
-}
-
-func (m Model) fullRefresh() []tea.Cmd {
-	return []tea.Cmd{
-		func() tea.Msg { return m.cmdHealth() },
-		func() tea.Msg { return m.cmdNode() },
-		func() tea.Msg { return m.cmdModels() },
-		func() tea.Msg { return m.cmdCaps() },
-		func() tea.Msg { return m.cmdProvs() },
-		func() tea.Msg { return m.cmdSessions() },
-	}
 }
 
 // ---- sessions ----
@@ -328,19 +410,8 @@ func (m Model) cmdSessionInspect() tea.Cmd {
 		if err != nil {
 			return sessionMsg{nil, err}
 		}
-		// also load history preview + wire chat tab to this session
-		h, herr := m.daemon.History(id, nil, u32p(100))
-		if herr != nil {
-			return sessionMsg{s, nil}
-		}
-		_ = h
 		return sessionMsg{s, nil}
 	}
-}
-
-// cmdSessionInspectWithHistory chains session+history for the Sessions tab.
-func (m *Model) cmdSessionInspectFull() tea.Cmd {
-	return func() tea.Msg { return statusMsg{"use enter"} }
 }
 
 func (m Model) cmdSessionCreate() tea.Cmd {
@@ -358,10 +429,7 @@ func (m Model) cmdSessionCreate() tea.Cmd {
 			Provider:  prov,
 			Model:     model,
 		})
-		if err != nil {
-			return errMsg{err}
-		}
-		return statusMsg{"created session " + r.SessionID}
+		return sessionCreatedMsg{r, err}
 	}
 }
 
@@ -382,37 +450,40 @@ func (m Model) defaultModel() (string, string, error) {
 
 // ---- chat ----
 
-func (m Model) cmdChatSend(text string) tea.Cmd {
+func (m *Model) cmdChatSend(text string) tea.Cmd {
+	if m.chatSending || m.chatActive {
+		return func() tea.Msg {
+			return statusMsg{"a turn is already pending; wait for completion or cancel it in Turns"}
+		}
+	}
+	m.chatSending = true
+	daemon, sid := m.daemon, strings.TrimSpace(m.chatSession.Value())
+	prov, model, _ := m.defaultModel()
 	return func() tea.Msg {
-		sid := strings.TrimSpace(m.chatSession.Value())
 		if sid == "" {
-			prov, model, _ := m.defaultModel()
 			cmdID, err := client.NewCommandID()
 			if err != nil {
-				return receiptMsg{nil, err}
+				return receiptMsg{err: err, text: text}
 			}
-			r, err := m.daemon.CreateSession(&client.CreateSessionRequest{
+			r, err := daemon.CreateSession(&client.CreateSessionRequest{
 				CommandID: cmdID + ":session",
 				Provider:  prov,
 				Model:     model,
 			})
 			if err != nil {
-				return receiptMsg{nil, err}
+				return receiptMsg{err: err, text: text}
 			}
 			sid = r.SessionID
 		}
 		cmdID, err := client.NewCommandID()
 		if err != nil {
-			return receiptMsg{nil, err}
+			return receiptMsg{err: err, text: text, session: sid}
 		}
-		r, err := m.daemon.SendMessage(sid, &client.SendMessageRequest{
+		r, err := daemon.SendMessage(sid, &client.SendMessageRequest{
 			CommandID: cmdID,
 			Text:      text,
 		})
-		if err != nil {
-			return receiptMsg{nil, err}
-		}
-		return receiptMsg{r, nil}
+		return receiptMsg{r: r, err: err, text: text, session: sid}
 	}
 }
 
@@ -444,7 +515,7 @@ func (m Model) cmdTurnCancel() tea.Cmd {
 		if id == "" {
 			return statusMsg{"nothing to cancel"}
 		}
-		// explicit cancellation; stop local follow but daemon turn continues to cancel
+		// Only this action explicitly asks the daemon to cancel execution.
 		cmdID, err := client.NewCommandID()
 		if err != nil {
 			return errMsg{err}
@@ -533,11 +604,29 @@ func (m *Model) cmdArtifactDownload() tea.Cmd {
 			return downloadMsg{nil, nil, err}
 		}
 		// publish only after checksum verification (done inside client)
-		if err := os.WriteFile(out, data, 0o600); err != nil {
+		if err := writeArtifact(out, data); err != nil {
 			return downloadMsg{nil, nil, err}
 		}
 		return downloadMsg{data, meta, nil}
 	}
+}
+
+// Publish verified bytes with an atomic rename so an existing output symlink
+// cannot redirect the write and a failed write cannot expose a partial file.
+func writeArtifact(out string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(out), ".hive-artifact-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), out)
 }
 
 // ---- providers ----
@@ -596,6 +685,9 @@ func (m Model) cmdGoModels() tea.Cmd {
 }
 
 func (m *Model) cmdGoRun(prompt string) tea.Cmd {
+	if m.goWorking {
+		return func() tea.Msg { return statusMsg{"a direct provider request is already running"} }
+	}
 	cat := provider.Catalog
 	if m.goCursor < 0 || m.goCursor >= len(cat) {
 		return func() tea.Msg { return goResultMsg{nil, fmt.Errorf("pick a model first")} }
@@ -603,30 +695,23 @@ func (m *Model) cmdGoRun(prompt string) tea.Cmd {
 	model := cat[m.goCursor].ID
 	stream := m.goStream
 	m.goWorking = true
-	m.goView.SetContent(m.goView.View() + "\n» " + model + ": " + truncate(prompt, 200) + "\n")
-	m.goView.GotoBottom()
+	m.appendGo("\n» " + model + ": " + truncate(prompt, 200) + "\n")
+	m.goRunPrefix = m.goText
+	gp, ch := m.gopro, m.goCh
 	return func() tea.Msg {
-		if m.gopro == nil {
+		if gp == nil {
 			return goResultMsg{nil, fmt.Errorf("no OPENCODE_GO_API_KEY")}
 		}
 		if stream {
-			r, err := m.gopro.CompleteStreaming(model, prompt, 512, "hive-direct", func(d string) {
+			r, err := gp.CompleteStreaming(model, prompt, 512, "hive-direct", func(d string) {
 				select {
-				case m.goCh <- d:
+				case ch <- d:
 				default:
 				}
 			})
-			// drain streamer into view is handled by frameDrain ticker; push final
-			_ = r
 			return goResultMsg{r, err}
 		}
-		r, err := m.gopro.Complete(model, prompt, 512, "hive-direct")
-		if err == nil && r != nil {
-			select {
-			case m.goCh <- r.Text + "\n":
-			default:
-			}
-		}
+		r, err := gp.Complete(model, prompt, 512, "hive-direct")
 		return goResultMsg{r, err}
 	}
 }

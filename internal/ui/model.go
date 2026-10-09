@@ -6,6 +6,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"hive/internal/client"
 	"hive/internal/config"
@@ -65,12 +67,25 @@ type (
 		err error
 	}
 	historyMsg struct {
-		p   *client.Page[client.MessageResponse]
-		err error
+		session    string
+		generation uint64
+		request    uint64
+		p          *client.Page[client.MessageResponse]
+		err        error
 	}
 	receiptMsg struct {
+		r       *client.CommandReceipt
+		err     error
+		text    string
+		session string
+	}
+	sessionCreatedMsg struct {
 		r   *client.CommandReceipt
 		err error
+	}
+	followResult struct {
+		frame *client.EventFrame
+		err   error
 	}
 	turnMsg struct {
 		t   *client.TurnResponse
@@ -121,7 +136,6 @@ type (
 		r   *provider.Result
 		err error
 	}
-	tickMsg       struct{}
 	frameDrainMsg struct{}
 	statusMsg     struct{ s string }
 	errMsg        struct{ err error }
@@ -149,15 +163,22 @@ type Model struct {
 	history    []client.MessageResponse
 
 	// chat
-	chatSession textinput.Model
-	chatBox     textarea.Model
-	chatView    viewport.Model
-	chatTurn    string
-	chatCursor  uint64
-	chatActive  bool
-	followCh    chan *client.EventFrame
-	followCtx   context.CancelFunc
-	streamBuf   string
+	chatSession        textinput.Model
+	chatBox            textarea.Model
+	chatView           viewport.Model
+	chatTurn           string
+	chatCursor         uint64
+	chatActive         bool
+	chatSending        bool
+	chatID             string
+	chatGeneration     uint64
+	chatHistoryRequest uint64
+	chatText           string
+	chatChunks         map[string]uint64
+	chatCompleted      map[string]bool
+	followCh           chan followResult
+	followCtx          context.CancelFunc
+	following          bool
 
 	// turns
 	turnInput  textinput.Model
@@ -179,25 +200,32 @@ type Model struct {
 	loginID     textinput.Model
 
 	// go direct
-	goCursor  int
-	goPrompt  textarea.Model
-	goStream  bool
-	goView    viewport.Model
-	goResult  *provider.Result
-	goIDs     []string
-	goWorking bool
-	goCh      chan string
+	goCursor    int
+	goPrompt    textarea.Model
+	goStream    bool
+	goView      viewport.Model
+	goResult    *provider.Result
+	goIDs       []string
+	goWorking   bool
+	goCh        chan string
+	goText      string
+	goRunPrefix string
+	detailView  viewport.Model
 
 	// generic single-line inspector
 	inspectInput textinput.Model
 	focusField   string // which input has focus on current tab
 }
 
-func New(cfg config.Config) Model {
-	daemon, _ := client.New(cfg.DaemonURL)
+func New(cfg config.Config) (Model, error) {
+	daemon, err := client.New(cfg.DaemonURL)
+	if err != nil {
+		return Model{}, err
+	}
 	if cfg.TokenAvails {
-		if d, err := client.NewWithTokenFile(cfg.DaemonURL, cfg.TokenFile); err == nil {
-			daemon = d
+		daemon, err = client.NewWithTokenFile(cfg.DaemonURL, cfg.TokenFile)
+		if err != nil {
+			return Model{}, err
 		}
 	}
 	var gp *provider.Client
@@ -223,6 +251,7 @@ func New(cfg config.Config) Model {
 	}
 	m := Model{
 		cfg: cfg, daemon: daemon, gopro: gp,
+		w: 80, h: 24,
 		chatSession:  ti("session id (empty = create new)"),
 		turnInput:    ti("turn id"),
 		artInput:     ti("artifact id (sha256)"),
@@ -230,31 +259,27 @@ func New(cfg config.Config) Model {
 		keyValue:     ti("api key (input hidden on screen log)"),
 		loginID:      ti("login id"),
 		inspectInput: ti("message id / tool id"),
-		followCh:     make(chan *client.EventFrame, 256),
 		goCh:         make(chan string, 256),
 	}
 	m.chatBox = ta("Type a message, Enter to send (Esc blurs first)")
 	m.goPrompt = ta("Direct provider prompt — Enter runs")
 	m.chatView = viewport.New(80, 12)
 	m.goView = viewport.New(80, 12)
+	m.detailView = viewport.New(80, 12)
 	m.keyProvider.SetValue("opencode-go")
 	m.keyValue.EchoMode = textinput.EchoPassword
 	m.keyValue.EchoCharacter = '•'
+	m.keyValue.CharLimit = 0
 	m.focusField = "chat"
-	return m
+	return m, nil
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchAll(m), tickCmd())
-}
-
-func tickCmd() tea.Cmd {
-	return tea.Tick(4000000000, func(_ time.Time) tea.Msg { return tickMsg{} })
-	// placeholder replaced below by fast drain ticker
+	return tea.Batch(fetchAll(m), fastTick())
 }
 
 func fastTick() tea.Cmd {
-	return tea.Tick(150000000, func(_ time.Time) tea.Msg { return frameDrainMsg{} })
+	return tea.Tick(150*time.Millisecond, func(_ time.Time) tea.Msg { return frameDrainMsg{} })
 }
 
 func fetchAll(m Model) tea.Cmd {
@@ -299,12 +324,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
-		m.chatView.Width = max(40, m.w-6)
-		m.chatView.Height = max(6, m.h-22)
-		m.goView.Width = max(40, m.w-6)
-		m.goView.Height = max(6, m.h-22)
-		m.chatBox.SetWidth(max(40, m.w-6))
-		m.goPrompt.SetWidth(max(40, m.w-6))
+		m.chatView.Width = max(1, m.w-2)
+		m.chatView.Height = max(1, m.h-16)
+		m.goView.Width = max(1, m.w-2)
+		m.goView.Height = max(1, m.h-22)
+		m.detailView.Width, m.detailView.Height = max(1, m.w), max(1, m.h-6)
+		m.chatBox.SetWidth(max(1, m.w-2))
+		m.goPrompt.SetWidth(max(1, m.w-2))
 		return m, nil
 	case tea.KeyMsg:
 		if m.handleKey(msg, &cmds) {
@@ -359,6 +385,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "sessions: " + msg.err.Error()
 		} else if msg.p != nil {
 			m.sessions = msg.p.Items
+			m.sessCursor = min(m.sessCursor, max(0, len(m.sessions)-1))
 			m.status = fmt.Sprintf("sessions: %d listed", len(m.sessions))
 		}
 		return m, nil
@@ -368,42 +395,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.sessDetail = msg.s
 			m.status = "session " + msg.s.ID
-			m.chatSession.SetValue(msg.s.ID)
+			m.selectChat(msg.s.ID)
 			m.chatCursor = msg.s.LastEventSeq
-			sid := msg.s.ID
-			cmds = append(cmds, func() tea.Msg {
-				p, err := m.daemon.History(sid, nil, u32p(100))
-				return historyMsg{p, err}
-			})
+			cmds = append(cmds, m.cmdHistory())
 		}
 		return m, tea.Batch(cmds...)
 	case historyMsg:
+		if msg.session != m.chatID || msg.generation != m.chatGeneration || msg.request != m.chatHistoryRequest {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status = "history: " + msg.err.Error()
 		} else if msg.p != nil {
 			m.history = msg.p.Items
+			m.chatCompleted = make(map[string]bool)
 			var sb strings.Builder
 			for _, mm := range m.history {
 				fmt.Fprintf(&sb, "%s: %s\n", mm.Role, mm.Text)
+				if mm.Status != "checkpoint" && mm.Status != "pending" && mm.Status != "" {
+					m.chatCompleted[mm.ID] = true
+				}
 			}
-			m.chatView.SetContent(sb.String())
+			m.chatText = sb.String()
+			m.chatView.SetContent(m.chatText)
 			m.chatView.GotoBottom()
 		}
 		return m, nil
 	case receiptMsg:
+		m.chatSending = false
 		if msg.err != nil {
 			m.status = "send: " + msg.err.Error()
-			m.chatActive = false
+			if m.chatID == "" && msg.session != "" {
+				m.selectChat(msg.session)
+			}
 		} else if msg.r != nil {
+			m.selectChat(msg.r.SessionID)
+			if strings.TrimSpace(m.chatBox.Value()) == msg.text {
+				m.chatBox.Reset()
+			}
 			m.status = fmt.Sprintf("accepted cmd %s rev %d evt %d", shortID(msg.r.CommandID), msg.r.Revision, msg.r.EventSequence)
 			if msg.r.TurnID != nil {
 				m.chatTurn = *msg.r.TurnID
 				m.chatCursor = msg.r.EventSequence
 				m.chatActive = true
-				m.streamBuf = ""
-				m.startFollow(m.chatSession.Value(), m.chatCursor)
-				cmds = append(cmds, fastTick())
+				m.startFollow(m.chatID, m.chatCursor)
 			}
+			cmds = append(cmds, m.cmdHistory())
+		}
+		return m, tea.Batch(cmds...)
+	case sessionCreatedMsg:
+		if msg.err != nil {
+			m.status = "create session: " + msg.err.Error()
+		} else if msg.r != nil {
+			m.selectChat(msg.r.SessionID)
+			m.status = "created session " + msg.r.SessionID
+			cmds = append(cmds, func() tea.Msg { return m.cmdSessions() })
 		}
 		return m, tea.Batch(cmds...)
 	case turnMsg:
@@ -456,10 +502,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.artBytes = len(msg.data)
 			m.status = fmt.Sprintf("artifact verified %d bytes", len(msg.data))
-			if m.artOut != "" {
-				// best effort write is done in the command already
-			}
-			_ = msg.meta
+			m.artMeta = msg.meta
 		}
 		return m, nil
 	case loginMsg:
@@ -493,14 +536,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.goIDs = msg.ids
 			m.status = fmt.Sprintf("go live models: %d", len(msg.ids))
 		}
-		m.goWorking = false
 		return m, nil
 	case goResultMsg:
+		m.drainGo()
 		m.goWorking = false
 		if msg.err != nil {
 			m.status = "go turn: " + msg.err.Error()
-			m.goView.SetContent(m.goView.View() + "\n[error] " + msg.err.Error())
+			m.appendGo("\n[error] " + msg.err.Error())
 		} else if msg.r != nil {
+			m.goText = m.goRunPrefix
+			m.appendGo(msg.r.Text + "\n")
 			m.goResult = msg.r
 			usage := "?"
 			if msg.r.Usage.Total != nil {
@@ -511,14 +556,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.goView.GotoBottom()
 		return m, nil
 	case frameDrainMsg:
-		m.drainFollow()
+		cmds = append(cmds, m.drainFollow()...)
 		m.drainGo()
-		if m.chatActive {
-			cmds = append(cmds, fastTick())
-		}
-		return m, tea.Batch(cmds...)
-	case tickMsg:
-		cmds = append(cmds, tickCmd())
+		cmds = append(cmds, fastTick())
 		return m, tea.Batch(cmds...)
 	case statusMsg:
 		m.status = msg.s
@@ -536,8 +576,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chatBox, c = m.chatBox.Update(msg)
 			cmds = append(cmds, c)
 		} else {
+			before := m.chatSession.Value()
 			var c tea.Cmd
 			m.chatSession, c = m.chatSession.Update(msg)
+			if m.chatSession.Value() != before {
+				m.selectChat(m.chatSession.Value())
+			}
 			cmds = append(cmds, c)
 			var c2 tea.Cmd
 			m.chatView, c2 = m.chatView.Update(msg)
@@ -583,19 +627,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// refreshProtected loads everything needing auth after health succeeds.
-func (m Model) refreshProtected() tea.Msg {
-	if _, err := m.daemon.Health(); err != nil {
-		return errMsg{err}
-	}
-	// chain: return node; other loads are triggered by keypress 'r' and init
-	n, err := m.daemon.Node()
-	if err != nil {
-		return nodeMsg{nil, err}
-	}
-	return nodeMsg{n, nil}
-}
-
 func shortID(s string) string {
 	if len(s) > 12 {
 		return s[:12]
@@ -610,119 +641,220 @@ func max(a, b int) int {
 	return b
 }
 
-// drainFollow moves buffered event frames into the chat viewport.
-func (m *Model) drainFollow() {
-	for {
-		select {
-		case f := <-m.followCh:
-			if f == nil {
-				m.chatActive = false
-				m.chatView.SetContent(m.chatView.View() + "\n[stream closed]\n")
-				m.chatView.GotoBottom()
-				return
+const maxTranscriptBytes = 2 * 1024 * 1024
+
+func (m *Model) appendChat(text string) {
+	m.chatText += utf8Prefix(text, max(0, maxTranscriptBytes-len(m.chatText)))
+	m.chatView.SetContent(m.chatText)
+	m.chatView.GotoBottom()
+}
+
+func (m *Model) appendGo(text string) {
+	m.goText += utf8Prefix(text, max(0, maxTranscriptBytes-len(m.goText)))
+	m.goView.SetContent(m.goText)
+	m.goView.GotoBottom()
+}
+
+func (m *Model) stopFollow() {
+	if m.followCtx != nil {
+		m.followCtx()
+		m.followCtx = nil
+	}
+	m.following = false
+	m.followCh = nil
+}
+
+func (m *Model) selectChat(session string) {
+	session = strings.TrimSpace(session)
+	m.chatSession.SetValue(session)
+	if session == m.chatID {
+		return
+	}
+	m.stopFollow()
+	m.chatID = session
+	m.chatGeneration++
+	m.chatCursor = 0
+	m.chatTurn = ""
+	m.chatActive = false
+	m.history = nil
+	m.chatText = ""
+	m.chatCompleted = nil
+	m.chatView.SetContent("")
+}
+
+func (m *Model) cmdHistory() tea.Cmd {
+	m.chatHistoryRequest++
+	request := m.chatHistoryRequest
+	session, generation, daemon := m.chatID, m.chatGeneration, m.daemon
+	return func() tea.Msg {
+		if session == "" {
+			return statusMsg{"enter a session id first"}
+		}
+		var items []client.MessageResponse
+		var after *uint64
+		var size int
+		for {
+			page, err := daemon.History(session, after, u32p(100))
+			if err != nil {
+				return historyMsg{session: session, generation: generation, request: request, err: err}
 			}
-			m.applyFrame(f)
-		default:
-			return
+			for _, message := range page.Items {
+				size += len(message.Text) + len(message.Role) + 3
+			}
+			if size > maxTranscriptBytes {
+				return historyMsg{session: session, generation: generation, request: request, err: fmt.Errorf("session history exceeds display limit")}
+			}
+			items = append(items, page.Items...)
+			if page.NextAfter == nil {
+				return historyMsg{session: session, generation: generation, request: request, p: &client.Page[client.MessageResponse]{Items: items}}
+			}
+			if (after != nil && *page.NextAfter <= *after) || len(page.Items) == 0 {
+				return historyMsg{session: session, generation: generation, request: request, err: fmt.Errorf("invalid history pagination cursor")}
+			}
+			after = page.NextAfter
 		}
 	}
 }
 
-func (m *Model) applyFrame(f *client.EventFrame) {
+// drainFollow moves buffered frames into the transcript and schedules canonical
+// history reads for committed snapshots, including turns completed while offline.
+func (m *Model) drainFollow() []tea.Cmd {
+	var cmds []tea.Cmd
+	for range 256 {
+		select {
+		case result := <-m.followCh:
+			if result.err != nil {
+				if result.err == io.EOF {
+					m.status = "event stream closed; press f to reconnect"
+				} else {
+					m.status = "event stream: " + result.err.Error()
+				}
+				m.stopFollow()
+				cmds = append(cmds, m.cmdHistory())
+				return cmds
+			}
+			if cmd := m.applyFrame(result.frame); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		default:
+			return cmds
+		}
+	}
+	return cmds
+}
+
+func (m *Model) applyFrame(f *client.EventFrame) tea.Cmd {
+	if f == nil {
+		return nil
+	}
 	switch f.Type {
 	case "delta":
+		if f.SessionID != m.chatID {
+			return nil
+		}
+		if f.MessageID != nil && m.chatCompleted[*f.MessageID] {
+			return nil
+		}
+		if f.StreamID != "" {
+			if m.chatChunks == nil {
+				m.chatChunks = make(map[string]uint64)
+			}
+			index, known := m.chatChunks[f.StreamID]
+			if known && f.ChunkIndex <= index {
+				return nil
+			}
+			if !known && len(m.chatChunks) >= 512 {
+				m.status = "event stream exceeded display limit; refresh history"
+				return nil
+			}
+			m.chatChunks[f.StreamID] = f.ChunkIndex
+		}
 		if f.Kind == "" || f.Kind == "text" {
-			m.streamBuf += f.Text
-			m.chatView.SetContent(m.chatView.View() + f.Text)
-			m.chatView.GotoBottom()
+			m.appendChat(f.Text)
 		} else {
-			m.chatView.SetContent(m.chatView.View() + fmt.Sprintf("\n[%s] %s", f.Kind, f.Text))
-			m.chatView.GotoBottom()
+			m.appendChat(fmt.Sprintf("\n[%s] %s", f.Kind, f.Text))
 		}
 	case "durable":
-		if f.Event != nil {
-			if f.Event.Sequence > m.chatCursor {
-				m.chatCursor = f.Event.Sequence
-			}
-			switch f.Event.Kind {
-			case "turn_completed", "turn_failed", "turn_cancelled", "turn_interrupted", "turn_incomplete":
-				m.chatActive = false
-				m.chatView.SetContent(m.chatView.View() + fmt.Sprintf("\n[%s]\n", f.Event.Kind))
-				m.chatView.GotoBottom()
-				// reconcile canonical text
-				go func(turnID, sess string) {}("", "")
-			case "assistant_message_completed", "assistant_message_checkpointed":
-				// canonical snapshot arrives via history poll below
-			}
+		if f.Event == nil || f.Event.SessionID != m.chatID || f.Event.Sequence <= m.chatCursor {
+			return nil
 		}
-	case "heartbeat":
-		// no-op
+		m.chatCursor = f.Event.Sequence
+		switch f.Event.Kind {
+		case "turn_completed", "turn_failed", "turn_cancelled", "turn_interrupted", "turn_incomplete":
+			if m.chatTurn == "" || (f.Event.TurnID != nil && *f.Event.TurnID == m.chatTurn) {
+				m.chatActive = false
+			}
+			m.status = f.Event.Kind
+			return m.cmdHistory()
+		case "assistant_message_completed", "assistant_message_checkpointed":
+			return m.cmdHistory()
+		}
 	}
+	return nil
 }
 
 func (m *Model) drainGo() {
-	for {
+	for range 256 {
 		select {
 		case d := <-m.goCh:
-			m.goView.SetContent(m.goView.View() + d)
-			m.goView.GotoBottom()
+			m.appendGo(d)
 		default:
 			return
 		}
 	}
 }
 
-// startFollow opens a follow=true stream in the background feeding followCh.
+// Each observer owns a separate queue and captures only immutable connection
+// state, so replacing a session cannot deliver old frames to its new observer.
 func (m *Model) startFollow(session string, after uint64) {
-	if m.followCtx != nil {
-		m.followCtx()
-	}
-	// drain stale
-	for {
-		select {
-		case <-m.followCh:
-		default:
-			goto drained
-		}
-	}
-drained:
-	ctx, cancel := context.WithCancel(context.Background())
-	m.followCtx = cancel
+	m.stopFollow()
+	m.selectChat(session)
 	if session == "" {
 		return
 	}
+	m.chatGeneration++
+	m.chatChunks = make(map[string]uint64)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.followCtx = cancel
+	m.following = true
+	ch, daemon := make(chan followResult, 256), m.daemon
+	m.followCh = ch
 	go func() {
-		defer func() {
+		send := func(result followResult) bool {
 			select {
-			case m.followCh <- nil:
+			case ch <- result:
+				return true
 			case <-ctx.Done():
+				return false
 			}
-		}()
-		stream, err := m.daemon.Events(session, after, true)
+		}
+		stream, err := daemon.EventsContext(ctx, session, after, true)
 		if err != nil {
+			send(followResult{err: err})
 			return
 		}
 		defer stream.Close()
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
 			f, err := stream.Next()
 			if err != nil {
+				send(followResult{err: err})
 				return
 			}
-			if f == nil {
-				return
-			}
-			select {
-			case m.followCh <- f:
-			case <-ctx.Done():
+			if !send(followResult{frame: f}) {
 				return
 			}
 		}
 	}()
+}
+
+func utf8Prefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && n < len(s) && s[n]&0xc0 == 0x80 {
+		n--
+	}
+	return s[:n]
 }
 
 // Styles
@@ -746,20 +878,41 @@ func (m Model) View() string {
 			tabs = append(tabs, dimStyle.Render(fmt.Sprintf("[%d]%s", i+1, n)))
 		}
 	}
-	sb.WriteString(titleStyle.Render("hive") + "  " + strings.Join(tabs, "  ") + "\n")
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("daemon %s  token %s  go-key %s", m.cfg.DaemonURL, tokenState(m.cfg), goState(m.cfg, m.gopro))) + "\n")
-	sb.WriteString(strings.Repeat("─", max(40, m.w-2)) + "\n")
-	sb.WriteString(m.viewTab())
-	sb.WriteString("\n" + strings.Repeat("─", max(40, m.w-2)) + "\n")
-	if m.status != "" {
-		sb.WriteString(dimStyle.Render("status: ") + m.status + "\n")
+	header := titleStyle.Render("hive") + "  " + strings.Join(tabs, "  ")
+	if lipgloss.Width(header) > m.w {
+		header = titleStyle.Render("hive") + fmt.Sprintf("  [%d/%d] %s · tab switches", m.tab+1, TabCount, tabNames[m.tab])
 	}
+	sb.WriteString(header + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("daemon %s  token %s  go-key %s", m.cfg.DaemonURL, tokenState(m.cfg), goState(m.cfg, m.gopro))) + "\n")
+	sb.WriteString(strings.Repeat("─", max(1, m.w-2)) + "\n")
+	bodyHeight := max(1, m.h-6)
+	switch m.tab {
+	case TabChat:
+		fixed := lipgloss.Height(strings.TrimSuffix(m.viewChat(), "\n")) - m.chatView.Height
+		m.chatView.Height = max(1, bodyHeight-fixed)
+	case TabGoDirect:
+		fixed := lipgloss.Height(strings.TrimSuffix(m.viewGo(), "\n")) - m.goView.Height
+		m.goView.Height = max(1, bodyHeight-fixed)
+	}
+	body := strings.TrimSuffix(m.viewTab(), "\n")
+	m.detailView.Width, m.detailView.Height = max(1, m.w), bodyHeight
+	m.detailView.SetContent(body)
+	if m.tab == TabChat || m.tab == TabGoDirect {
+		m.detailView.GotoTop()
+	}
+	sb.WriteString(m.detailView.View())
+	sb.WriteString("\n" + strings.Repeat("─", max(1, m.w-2)) + "\n")
+	sb.WriteString(dimStyle.Render("status: ") + m.status + "\n")
 	if m.showHelp {
 		sb.WriteString(dimStyle.Render("keys: 1-7 tabs · tab cycle · r refresh · enter run/send · c new session · esc blur · s stream toggle (GoDirect) · q quit · ? help") + "\n")
 	} else {
-		sb.WriteString(dimStyle.Render("? help · q quit") + "\n")
+		sb.WriteString(dimStyle.Render("? help · pgup/pgdown scroll · q quit") + "\n")
 	}
-	return sb.String()
+	lines := strings.Split(strings.TrimSuffix(sb.String(), "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = ansi.Truncate(line, max(1, m.w), "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func tokenState(c config.Config) string {
@@ -895,7 +1048,7 @@ func (m Model) viewChat() string {
 
 func (m Model) viewTurns() string {
 	var sb strings.Builder
-	sb.WriteString("turn: " + m.turnInput.View() + "   msg/tool: " + m.inspectInput.View() + "\n")
+	sb.WriteString("turn: " + m.turnInput.View() + "\nmsg/tool: " + m.inspectInput.View() + "\n")
 	if m.turnDetail != nil {
 		t := m.turnDetail
 		resolved := ""
@@ -932,7 +1085,7 @@ func (m Model) viewTurns() string {
 	if m.singleMsg != nil {
 		sb.WriteString(fmt.Sprintf("message %s [%s]: %s\n", m.singleMsg.ID, m.singleMsg.Role, truncate(m.singleMsg.Text, 300)))
 	}
-	sb.WriteString(dimStyle.Render("enter show turn · x cancel · q-requests · t-tools · m message · i tool · r refresh") + "\n")
+	sb.WriteString(dimStyle.Render("enter show turn · x cancel · p requests · t tools · m message · i tool · F1/F2 focus") + "\n")
 	return sb.String()
 }
 
@@ -972,7 +1125,10 @@ func (m Model) viewGo() string {
 		return sb.String()
 	}
 	sb.WriteString(dimStyle.Render(fmt.Sprintf("catalog %d models · live %d · stream=%t (s toggles)", len(provider.Catalog), len(m.goIDs), m.goStream)) + "\n")
-	for i, mo := range provider.Catalog {
+	rows := min(6, max(1, (m.h-13)/2))
+	start := min(max(0, m.goCursor-rows/2), max(0, len(provider.Catalog)-rows))
+	for i := start; i < min(len(provider.Catalog), start+rows); i++ {
+		mo := provider.Catalog[i]
 		cursor := "  "
 		if i == m.goCursor {
 			cursor = "▸ "
@@ -999,7 +1155,7 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return utf8Prefix(s, n) + "…"
 }
 func previewOut(s *string) string {
 	if s == nil {

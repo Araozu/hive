@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -125,15 +126,18 @@ func New(apiKey string) (*Client, error) {
 		return nil, fmt.Errorf("missing API key: set OPENCODE_GO_API_KEY")
 	}
 	return &Client{
-		http:    &http.Client{Timeout: 120 * time.Second},
+		http:    &http.Client{Timeout: 120 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		baseURL: BaseURL,
-		apiKey:  apiKey,
+		apiKey:  strings.TrimSpace(apiKey),
 	}, nil
 }
 
 // ListModels fetches GET /models advertised ids.
 func (c *Client) ListModels() ([]string, error) {
-	req, _ := http.NewRequest("GET", c.baseURL+"/models", nil)
+	req, err := http.NewRequest("GET", c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set(SessionHeader, "hive-model-discovery")
 	req.Header.Set("User-Agent", UserAgent)
@@ -142,7 +146,7 @@ func (c *Client) ListModels() ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := readBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -154,11 +158,14 @@ func (c *Client) ListModels() ([]string, error) {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &v); err != nil {
+	if err := json.Unmarshal(body, &v); err != nil || v.Data == nil {
 		return nil, fmt.Errorf("provider opencode-go returned an unrecognized response")
 	}
 	out := make([]string, 0, len(v.Data))
 	for _, d := range v.Data {
+		if d.ID == "" {
+			return nil, fmt.Errorf("provider returned an invalid model id")
+		}
 		out = append(out, d.ID)
 	}
 	return out, nil
@@ -169,8 +176,14 @@ func openaiMessages(prompt string) []any {
 }
 
 func (c *Client) post(wire Wire, sessionID string, payload any) (map[string]any, http.Header, error) {
-	raw, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", c.baseURL+wire.Path(), bytes.NewReader(raw))
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	req, err := http.NewRequest("POST", c.baseURL+wire.Path(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set(SessionHeader, sessionID)
@@ -185,7 +198,7 @@ func (c *Client) post(wire Wire, sessionID string, payload any) (map[string]any,
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := readBody(resp.Body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -219,7 +232,7 @@ func usageOf(m map[string]any) Usage {
 	}
 	num := func(keys ...string) *uint64 {
 		for _, k := range keys {
-			if f, ok := u[k].(float64); ok {
+			if f, ok := u[k].(float64); ok && f >= 0 && f < math.Exp2(64) && math.Trunc(f) == f {
 				v := uint64(f)
 				return &v
 			}
@@ -227,6 +240,71 @@ func usageOf(m map[string]any) Usage {
 		return nil
 	}
 	return Usage{Input: num("input_tokens", "prompt_tokens"), Output: num("output_tokens", "completion_tokens"), Total: num("total_tokens")}
+}
+
+const maxProviderBytes = 8 << 20
+
+func readBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxProviderBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("provider response read failed: %w", err)
+	}
+	if len(data) > maxProviderBytes {
+		return nil, fmt.Errorf("provider response exceeded size limit")
+	}
+	return data, nil
+}
+
+func mergeUsage(current, update Usage) Usage {
+	if update.Input != nil {
+		current.Input = update.Input
+	}
+	if update.Output != nil {
+		current.Output = update.Output
+	}
+	if update.Total != nil {
+		current.Total = update.Total
+	}
+	return current
+}
+
+func totalUsage(u Usage) Usage {
+	if u.Total == nil && u.Input != nil && u.Output != nil && *u.Input <= math.MaxUint64-*u.Output {
+		total := *u.Input + *u.Output
+		u.Total = &total
+	}
+	return u
+}
+
+func payloadFor(wire Wire, model, prompt string, maxTokens uint32, stream bool) map[string]any {
+	payload := map[string]any{"model": model}
+	switch wire {
+	case WireResponses:
+		payload["input"], payload["max_output_tokens"] = prompt, maxTokens
+	default:
+		payload["messages"], payload["max_tokens"] = openaiMessages(prompt), maxTokens
+	}
+	if stream {
+		payload["stream"] = true
+	}
+	return payload
+}
+
+func parseResult(wire Wire, model string, v map[string]any) (*Result, error) {
+	var text, outcome string
+	var err error
+	switch wire {
+	case WireChat:
+		text, outcome, err = parseChat(v)
+	case WireResponses:
+		text, outcome, err = parseResponses(v)
+	case WireMessages:
+		text, outcome, err = parseMessages(v)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Model: model, ResolvedModel: str(v, "model"), Text: text, Usage: totalUsage(usageOf(v)), Wire: wire, Outcome: outcome}, nil
 }
 
 // Complete runs one non-streaming turn on the model's native wire.
@@ -238,41 +316,15 @@ func (c *Client) Complete(model, prompt string, maxTokens uint32, sessionID stri
 	if sessionID == "" {
 		sessionID = "hive-direct"
 	}
-	switch wire {
-	case WireChat:
-		v, _, err := c.post(wire, sessionID, map[string]any{
-			"model": model, "messages": openaiMessages(prompt),
-			"max_tokens": maxTokens,
-		})
-		if err != nil {
-			return nil, err
-		}
-		text, outcome := parseChat(v)
-		return &Result{Model: model, ResolvedModel: str(v, "model"), Text: text, Usage: usageOf(v), Wire: wire, Outcome: outcome}, nil
-	case WireResponses:
-		v, _, err := c.post(wire, sessionID, map[string]any{
-			"model": model, "input": prompt, "max_output_tokens": maxTokens,
-		})
-		if err != nil {
-			return nil, err
-		}
-		text, outcome := parseResponses(v)
-		return &Result{Model: model, ResolvedModel: str(v, "model"), Text: text, Usage: usageOf(v), Wire: wire, Outcome: outcome}, nil
-	default:
-		payload := map[string]any{
-			"model": model, "max_tokens": maxTokens,
-			"messages": []any{map[string]any{"role": "user", "content": prompt}},
-		}
-		v, _, err := c.post(wire, sessionID, payload)
-		if err != nil {
-			return nil, err
-		}
-		text, outcome := parseMessages(v)
-		return &Result{Model: model, ResolvedModel: str(v, "model"), Text: text, Usage: usageOf(v), Wire: wire, Outcome: outcome}, nil
+	v, _, err := c.post(wire, sessionID, payloadFor(wire, model, prompt, maxTokens, false))
+	if err != nil {
+		return nil, err
 	}
+	return parseResult(wire, model, v)
 }
 
-// CompleteStreaming runs one SSE turn, calling onDelta per text delta.
+// CompleteStreaming folds complete SSE events and requires an explicit terminal
+// outcome. Deltas are provisional; the returned text is authoritative.
 func (c *Client) CompleteStreaming(model, prompt string, maxTokens uint32, sessionID string, onDelta func(text string)) (*Result, error) {
 	wire, err := WireFor(model)
 	if err != nil {
@@ -281,18 +333,14 @@ func (c *Client) CompleteStreaming(model, prompt string, maxTokens uint32, sessi
 	if sessionID == "" {
 		sessionID = "hive-direct"
 	}
-	var payload any
-	switch wire {
-	case WireChat:
-		payload = map[string]any{"model": model, "messages": openaiMessages(prompt), "max_tokens": maxTokens, "stream": true}
-	case WireResponses:
-		payload = map[string]any{"model": model, "input": prompt, "max_output_tokens": maxTokens, "stream": true}
-	default:
-		payload = map[string]any{"model": model, "max_tokens": maxTokens,
-			"messages": []any{map[string]any{"role": "user", "content": prompt}}, "stream": true}
+	raw, err := json.Marshal(payloadFor(wire, model, prompt, maxTokens, true))
+	if err != nil {
+		return nil, err
 	}
-	raw, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", c.baseURL+wire.Path(), bytes.NewReader(raw))
+	req, err := http.NewRequest("POST", c.baseURL+wire.Path(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set(SessionHeader, sessionID)
@@ -311,206 +359,325 @@ func (c *Client) CompleteStreaming(model, prompt string, maxTokens uint32, sessi
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("provider opencode-go returned HTTP %d", resp.StatusCode)
 	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "text/event-stream") {
-		// Gateway ignored stream:true; parse as blocking JSON.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		body, err := readBody(resp.Body)
+		if err != nil {
+			return nil, err
+		}
 		var v map[string]any
 		if err := json.Unmarshal(body, &v); err != nil {
 			return nil, fmt.Errorf("provider returned an unrecognized response")
 		}
-		var text, outcome string
-		switch wire {
-		case WireChat:
-			text, outcome = parseChat(v)
-		case WireResponses:
-			text, outcome = parseResponses(v)
-		default:
-			text, outcome = parseMessages(v)
+		r, err := parseResult(wire, model, v)
+		if err == nil && r.Text != "" && onDelta != nil {
+			onDelta(r.Text)
 		}
-		if text != "" && onDelta != nil {
-			onDelta(text)
-		}
-		return &Result{Model: model, ResolvedModel: str(v, "model"), Text: text, Usage: usageOf(v), Wire: wire, Outcome: outcome}, nil
+		return r, err
 	}
 	var assembled strings.Builder
-	var resolved string
+	var resolved, outcome string
 	var usage Usage
-	var outcome string
 	var sawTerminal bool
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 256*1024), 256*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	appendDelta := func(text string) error {
+		if sawTerminal {
+			return fmt.Errorf("provider sent content after terminal outcome")
 		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		if assembled.Len()+len(text) > maxProviderBytes {
+			return fmt.Errorf("provider stream exceeded size limit")
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		assembled.WriteString(text)
+		if onDelta != nil {
+			onDelta(text)
+		}
+		return nil
+	}
+	process := func(data string) (bool, error) {
 		if data == "[DONE]" {
-			if wire == WireChat && sawTerminal {
-				break
+			if !sawTerminal {
+				return false, fmt.Errorf("stream ended before terminal event")
 			}
-			if wire == WireChat {
-				continue
-			}
-			continue
+			return true, nil
 		}
 		var v map[string]any
-		if err := json.Unmarshal([]byte(data), &v); err != nil {
-			continue
+		if err := json.Unmarshal([]byte(data), &v); err != nil || v == nil {
+			return false, fmt.Errorf("provider returned an invalid stream event")
 		}
-		if m, _ := v["model"].(string); m != "" {
+		typ := str(v, "type")
+		if v["error"] != nil || typ == "error" || typ == "response.failed" || typ == "response.error" {
+			return false, fmt.Errorf("provider reported a failed stream")
+		}
+		if m := str(v, "model"); m != "" {
 			resolved = m
 		}
-		if u, ok := v["usage"].(map[string]any); ok {
-			usage = usageOf(map[string]any{"usage": u})
-		}
+		usage = mergeUsage(usage, usageOf(v))
 		switch wire {
 		case WireChat:
-			if ch, ok := v["choices"].([]any); ok && len(ch) > 0 {
-				if cm, ok := ch[0].(map[string]any); ok {
-					if d, ok := cm["delta"].(map[string]any); ok {
-						if t, _ := d["content"].(string); t != "" {
-							assembled.WriteString(t)
-							if onDelta != nil {
-								onDelta(t)
-							}
+			if choices, ok := v["choices"].([]any); ok && len(choices) > 0 {
+				cm, ok := choices[0].(map[string]any)
+				if !ok {
+					return false, fmt.Errorf("invalid chat stream choice")
+				}
+				if delta, ok := cm["delta"].(map[string]any); ok && delta["content"] != nil {
+					text, ok := delta["content"].(string)
+					if !ok {
+						return false, fmt.Errorf("invalid chat stream content")
+					}
+					if text != "" {
+						if err := appendDelta(text); err != nil {
+							return false, err
 						}
 					}
-					if fr, _ := cm["finish_reason"].(string); fr != "" {
-						sawTerminal = true
-						outcome = chatOutcome(fr)
+				}
+				if fr := str(cm, "finish_reason"); fr != "" {
+					if sawTerminal {
+						return false, fmt.Errorf("multiple terminal outcomes")
 					}
+					outcome, err = chatOutcome(fr)
+					if err != nil {
+						return false, err
+					}
+					sawTerminal = true
 				}
 			}
 		case WireMessages:
-			if typ, _ := v["type"].(string); typ == "content_block_delta" {
-				if d, ok := v["delta"].(map[string]any); ok {
-					if t, _ := d["text"].(string); t != "" {
-						assembled.WriteString(t)
-						if onDelta != nil {
-							onDelta(t)
-						}
+			switch typ {
+			case "message_start":
+				if msg, ok := v["message"].(map[string]any); ok {
+					resolved = str(msg, "model")
+					usage = mergeUsage(usage, usageOf(msg))
+				}
+			case "content_block_start":
+				if text := str(v, "content_block", "text"); text != "" {
+					if err := appendDelta(text); err != nil {
+						return false, err
 					}
 				}
-			} else if typ, _ := v["type"].(string); typ == "message_stop" {
-				sawTerminal = true
-				outcome = "completed"
-			}
-			if msg, ok := v["message"].(map[string]any); ok {
-				if u, ok := msg["usage"].(map[string]any); ok {
-					usage = usageOf(map[string]any{"usage": u})
+			case "content_block_delta":
+				if delta, ok := v["delta"].(map[string]any); ok && delta["text"] != nil {
+					text, ok := delta["text"].(string)
+					if !ok {
+						return false, fmt.Errorf("invalid messages stream content")
+					}
+					if err := appendDelta(text); err != nil {
+						return false, err
+					}
 				}
+			case "message_delta":
+				if reason := str(v, "delta", "stop_reason"); reason != "" {
+					outcome, err = messagesOutcome(reason)
+					if err != nil {
+						return false, err
+					}
+				}
+			case "message_stop":
+				if outcome == "" {
+					return false, fmt.Errorf("messages stream ended without stop reason")
+				}
+				sawTerminal = true
+				return true, nil
 			}
 		case WireResponses:
-			if typ, _ := v["type"].(string); typ == "response.output_text.delta" {
-				if t, _ := v["delta"].(string); t != "" {
-					assembled.WriteString(t)
-					if onDelta != nil {
-						onDelta(t)
-					}
+			switch typ {
+			case "response.output_text.delta":
+				text, ok := v["delta"].(string)
+				if !ok {
+					return false, fmt.Errorf("invalid responses stream content")
 				}
-			} else if typ, _ := v["type"].(string); typ == "response.completed" || typ == "response.incomplete" {
+				if err := appendDelta(text); err != nil {
+					return false, err
+				}
+			case "response.completed", "response.incomplete":
+				response, ok := v["response"].(map[string]any)
+				if !ok {
+					return false, fmt.Errorf("terminal event lacks response")
+				}
+				r, err := parseResult(wire, model, response)
+				if err != nil {
+					return false, err
+				}
+				if (typ == "response.completed") != (r.Outcome == "completed") {
+					return false, fmt.Errorf("response status contradicts terminal event")
+				}
+				assembled.Reset()
+				assembled.WriteString(r.Text)
+				resolved, usage, outcome = r.ResolvedModel, r.Usage, r.Outcome
 				sawTerminal = true
-				if r, ok := v["response"].(map[string]any); ok {
-					t, o := parseResponses(r)
-					assembled.Reset()
-					assembled.WriteString(t)
-					usage = usageOf(r)
-					outcome = o
-				}
+				return true, nil
 			}
 		}
+		return false, nil
 	}
-	if !sawTerminal && outcome == "" {
-		// Some gateways close after deltas without an explicit terminal
-		// event when the turn completed; accept assembled text.
-		if assembled.Len() > 0 {
-			outcome = "completed"
-		} else {
-			return nil, fmt.Errorf("stream ended before terminal event")
-		}
-	}
-	if outcome == "" {
-		outcome = "completed"
-	}
-	return &Result{Model: model, ResolvedModel: resolved, Text: assembled.String(), Usage: usage, Wire: wire, Outcome: outcome}, nil
-}
-
-func chatOutcome(fr string) string {
-	switch fr {
-	case "stop":
-		return "completed"
-	case "length":
-		return "incomplete:max_tokens"
-	case "content_filter":
-		return "incomplete:content_filter"
-	default:
-		return "completed"
-	}
-}
-
-func parseChat(v map[string]any) (string, string) {
-	ch, _ := v["choices"].([]any)
-	if len(ch) == 0 {
-		return "", "completed"
-	}
-	cm, _ := ch[0].(map[string]any)
-	msg, _ := cm["message"].(map[string]any)
-	t, _ := msg["content"].(string)
-	fr, _ := cm["finish_reason"].(string)
-	if fr == "" {
-		return t, "completed"
-	}
-	return t, chatOutcome(fr)
-}
-
-func parseResponses(v map[string]any) (string, string) {
-	status, _ := v["status"].(string)
-	var sb strings.Builder
-	if out, ok := v["output"].([]any); ok {
-		for _, it := range out {
-			im, _ := it.(map[string]any)
-			if typ, _ := im["type"].(string); typ != "message" {
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	var data []string
+	var frameBytes int
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if len(data) == 0 {
 				continue
 			}
-			if content, ok := im["content"].([]any); ok {
-				for _, p := range content {
-					pm, _ := p.(map[string]any)
-					if typ, _ := pm["type"].(string); typ != "output_text" {
-						continue
-					}
-					if t, _ := pm["text"].(string); t != "" {
-						sb.WriteString(t)
-					}
-				}
+			done, err := process(strings.Join(data, "\n"))
+			data, frameBytes = nil, 0
+			if err != nil {
+				return nil, err
 			}
+			if done {
+				break
+			}
+		} else if strings.HasPrefix(line, "data:") {
+			part := strings.TrimPrefix(line, "data:")
+			part = strings.TrimPrefix(part, " ")
+			frameBytes += len(part) + 1
+			if frameBytes > 256*1024 {
+				return nil, fmt.Errorf("provider stream event exceeded size limit")
+			}
+			data = append(data, part)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("provider stream read failed: %w", err)
+	}
+	if len(data) > 0 {
+		if _, err := process(strings.Join(data, "\n")); err != nil {
+			return nil, err
+		}
+	}
+	if !sawTerminal {
+		return nil, fmt.Errorf("stream ended before terminal event")
+	}
+	return &Result{Model: model, ResolvedModel: resolved, Text: assembled.String(), Usage: totalUsage(usage), Wire: wire, Outcome: outcome}, nil
+}
+
+func chatOutcome(reason string) (string, error) {
+	switch reason {
+	case "stop":
+		return "completed", nil
+	case "length":
+		return "incomplete:max_tokens", nil
+	case "content_filter":
+		return "incomplete:content_filter", nil
+	case "tool_calls":
+		return "incomplete:tool_calls", nil
+	default:
+		return "", fmt.Errorf("unknown chat finish reason")
+	}
+}
+
+func messagesOutcome(reason string) (string, error) {
+	switch reason {
+	case "end_turn", "stop_sequence":
+		return "completed", nil
+	case "max_tokens":
+		return "incomplete:max_tokens", nil
+	case "tool_use":
+		return "incomplete:tool_calls", nil
+	case "refusal":
+		return "incomplete:refusal", nil
+	default:
+		return "", fmt.Errorf("unknown messages stop reason")
+	}
+}
+
+func parseChat(v map[string]any) (string, string, error) {
+	choices, ok := v["choices"].([]any)
+	if !ok || len(choices) != 1 {
+		return "", "", fmt.Errorf("provider returned an invalid chat response")
+	}
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		return "", "", fmt.Errorf("provider returned an invalid chat choice")
+	}
+	msg, ok := choice["message"].(map[string]any)
+	if !ok {
+		return "", "", fmt.Errorf("provider returned no assistant message")
+	}
+	var text string
+	if msg["content"] != nil {
+		text, ok = msg["content"].(string)
+		if !ok {
+			return "", "", fmt.Errorf("provider returned invalid chat content")
+		}
+	}
+	if refusal := str(msg, "refusal"); refusal != "" {
+		text += refusal
+	}
+	outcome, err := chatOutcome(str(choice, "finish_reason"))
+	return text, outcome, err
+}
+
+func parseResponses(v map[string]any) (string, string, error) {
+	status := str(v, "status")
+	if status != "completed" && status != "incomplete" {
+		return "", "", fmt.Errorf("provider returned no successful terminal response")
+	}
+	output, ok := v["output"].([]any)
+	if !ok {
+		return "", "", fmt.Errorf("provider returned invalid responses output")
+	}
+	var text strings.Builder
+	for _, item := range output {
+		message, ok := item.(map[string]any)
+		if !ok {
+			return "", "", fmt.Errorf("provider returned invalid output item")
+		}
+		if str(message, "type") != "message" {
+			continue
+		}
+		content, ok := message["content"].([]any)
+		if !ok {
+			return "", "", fmt.Errorf("provider returned invalid message content")
+		}
+		for _, part := range content {
+			p, ok := part.(map[string]any)
+			if !ok {
+				return "", "", fmt.Errorf("provider returned invalid content part")
+			}
+			field := "text"
+			switch str(p, "type") {
+			case "output_text":
+			case "refusal":
+				field = "refusal"
+			default:
+				return "", "", fmt.Errorf("provider returned unsupported content part")
+			}
+			t, ok := p[field].(string)
+			if !ok {
+				return "", "", fmt.Errorf("provider returned invalid output text")
+			}
+			text.WriteString(t)
 		}
 	}
 	if status == "incomplete" {
-		return sb.String(), "incomplete:max_output_tokens"
+		reason := str(v, "incomplete_details", "reason")
+		if reason == "" {
+			reason = "unknown"
+		}
+		return text.String(), "incomplete:" + reason, nil
 	}
-	return sb.String(), "completed"
+	return text.String(), "completed", nil
 }
 
-func parseMessages(v map[string]any) (string, string) {
-	var sb strings.Builder
-	if content, ok := v["content"].([]any); ok {
-		for _, b := range content {
-			bm, _ := b.(map[string]any)
-			if typ, _ := bm["type"].(string); typ != "text" {
-				continue
-			}
-			if t, _ := bm["text"].(string); t != "" {
-				sb.WriteString(t)
-			}
+func parseMessages(v map[string]any) (string, string, error) {
+	content, ok := v["content"].([]any)
+	if !ok {
+		return "", "", fmt.Errorf("provider returned invalid messages content")
+	}
+	var text strings.Builder
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok {
+			return "", "", fmt.Errorf("provider returned invalid content block")
 		}
+		if str(b, "type") != "text" {
+			continue
+		}
+		t, ok := b["text"].(string)
+		if !ok {
+			return "", "", fmt.Errorf("provider returned invalid message text")
+		}
+		text.WriteString(t)
 	}
-	if sr, _ := v["stop_reason"].(string); sr == "max_tokens" {
-		return sb.String(), "incomplete:max_tokens"
-	}
-	return sb.String(), "completed"
+	outcome, err := messagesOutcome(str(v, "stop_reason"))
+	return text.String(), outcome, err
 }

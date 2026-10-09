@@ -5,15 +5,18 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -72,13 +75,20 @@ func withToken(endpoint, token string, has bool) (*DaemonClient, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("daemon URL must use http or https")
 	}
-	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("daemon URL must include a host")
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || strings.Contains(endpoint, "#") || u.User != nil {
 		return nil, fmt.Errorf("daemon URL must be an origin without path/query/fragment/credentials")
 	}
-	base := strings.TrimSuffix(endpoint, "/")
+	base := u.Scheme + "://" + u.Host
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.ResponseHeaderTimeout = 10 * time.Second
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &DaemonClient{
-		http:     &http.Client{Timeout: 10 * time.Second},
-		stream:   &http.Client{},
+		http:     &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: noRedirect},
+		stream:   &http.Client{Transport: transport, CheckRedirect: noRedirect},
 		endpoint: base,
 		token:    token,
 		hasToken: has,
@@ -104,10 +114,16 @@ func readBounded(resp *http.Response, limit int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func apiError(status int, body []byte) error {
+func apiError(status int, body []byte, secrets ...string) error {
 	var e ErrorResponse
 	if err := json.Unmarshal(body, &e); err != nil {
 		e = ErrorResponse{Code: "http_error", Message: "daemon request failed"}
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			e.Code = strings.ReplaceAll(e.Code, secret, "[REDACTED]")
+			e.Message = strings.ReplaceAll(e.Message, secret, "[REDACTED]")
+		}
 	}
 	if status == 401 {
 		return &Unauthorized{APIError{Status: status, Code: e.Code, Message: e.Message}}
@@ -153,6 +169,9 @@ func readTokenFile(path string) (string, error) {
 	if err != nil || !st.Mode().IsRegular() {
 		return "", fmt.Errorf("token file must be a regular file")
 	}
+	if runtime.GOOS != "windows" && st.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("token file must be private (chmod 600)")
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("could not read token file: %w", err)
@@ -176,7 +195,15 @@ func readTokenFile(path string) (string, error) {
 
 // Health is anonymous; it also validates service + API version.
 func (c *DaemonClient) Health() (*HealthResponse, error) {
-	resp, err := c.http.Get(c.endpoint + "/v1/health")
+	return c.healthContext(context.Background())
+}
+
+func (c *DaemonClient) healthContext(ctx context.Context) (*HealthResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.endpoint+"/v1/health", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("daemon request failed: %w", err)
 	}
@@ -185,7 +212,7 @@ func (c *DaemonClient) Health() (*HealthResponse, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, apiError(resp.StatusCode, body)
+		return nil, apiError(resp.StatusCode, body, c.token)
 	}
 	var h HealthResponse
 	if err := json.Unmarshal(body, &h); err != nil {
@@ -218,7 +245,7 @@ func (c *DaemonClient) getJSON(path string, out any) error {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError(resp.StatusCode, body)
+		return apiError(resp.StatusCode, body, c.token)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("daemon returned an invalid or oversized response")
@@ -254,7 +281,11 @@ func (c *DaemonClient) mutateJSON(method, path string, in, out any) error {
 	if resp.StatusCode != 200 && resp.StatusCode != 202 && resp.StatusCode != 201 {
 		// Daemon uses 202 for accepted mutations and 200 for reads/key set.
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return apiError(resp.StatusCode, body)
+			secrets := []string{c.token}
+			if key, ok := in.(*SetAPIKeyRequest); ok && key != nil {
+				secrets = append(secrets, key.APIKey)
+			}
+			return apiError(resp.StatusCode, body, secrets...)
 		}
 	}
 	if err := json.Unmarshal(body, out); err != nil {
@@ -271,7 +302,8 @@ func (c *DaemonClient) Node() (*NodeResponse, error) {
 
 func (c *DaemonClient) Models() ([]ModelResponse, error) {
 	var m []ModelResponse
-	return m, c.getJSON("/v1/models", &m)
+	err := c.getJSON("/v1/models", &m)
+	return m, err
 }
 
 func (c *DaemonClient) Capabilities() (*CapabilitiesResponse, error) {
@@ -381,7 +413,9 @@ func (c *DaemonClient) DownloadArtifact(id string) ([]byte, *ArtifactResponse, e
 	if _, err := c.Health(); err != nil {
 		return nil, nil, err
 	}
-	req, err := http.NewRequest("GET", c.endpoint+"/v1/artifacts/"+id+"/content", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", c.endpoint+"/v1/artifacts/"+id+"/content", nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -393,7 +427,7 @@ func (c *DaemonClient) DownloadArtifact(id string) ([]byte, *ArtifactResponse, e
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		return nil, nil, apiError(resp.StatusCode, body)
+		return nil, nil, apiError(resp.StatusCode, body, c.token)
 	}
 	h := sha256.New()
 	var buf bytes.Buffer
@@ -424,15 +458,13 @@ func (c *DaemonClient) DownloadArtifact(id string) ([]byte, *ArtifactResponse, e
 
 func (c *DaemonClient) Providers() ([]ProviderStatus, error) {
 	var p []ProviderStatus
-	return p, c.getJSON("/v1/providers", &p)
+	err := c.getJSON("/v1/providers", &p)
+	return p, err
 }
 
 func (c *DaemonClient) SetProviderKey(provider string, req *SetAPIKeyRequest) (*ProviderStatus, error) {
 	if err := checkID(provider); err != nil {
-		// provider ids contain hyphens only; reuse check with dashes allowed.
-		if provider == "" {
-			return nil, err
-		}
+		return nil, err
 	}
 	var s ProviderStatus
 	return &s, c.mutateJSON("PUT", "/v1/providers/"+provider+"/api-key", req, &s)
@@ -473,14 +505,20 @@ type EventStream struct {
 
 // Events opens GET /v1/sessions/{id}/events?after=&follow=.
 func (c *DaemonClient) Events(sessionID string, after uint64, follow bool) (*EventStream, error) {
+	return c.EventsContext(context.Background(), sessionID, after, follow)
+}
+
+// EventsContext cancels both opening and reading a follow stream when ctx ends.
+// It only closes the observation connection; daemon execution is independent.
+func (c *DaemonClient) EventsContext(ctx context.Context, sessionID string, after uint64, follow bool) (*EventStream, error) {
 	if err := checkID(sessionID); err != nil {
 		return nil, err
 	}
-	if _, err := c.Health(); err != nil {
+	if _, err := c.healthContext(ctx); err != nil {
 		return nil, err
 	}
 	u := fmt.Sprintf("%s/v1/sessions/%s/events?after=%d&follow=%t", c.endpoint, sessionID, after, follow)
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -492,7 +530,7 @@ func (c *DaemonClient) Events(sessionID string, after uint64, follow bool) (*Eve
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		resp.Body.Close()
-		return nil, apiError(resp.StatusCode, body)
+		return nil, apiError(resp.StatusCode, body, c.token)
 	}
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
@@ -509,6 +547,9 @@ func (s *EventStream) Next() (*EventFrame, error) {
 		var f EventFrame
 		if err := json.Unmarshal(line, &f); err != nil {
 			return nil, fmt.Errorf("daemon event stream returned an invalid or oversized frame")
+		}
+		if f.Type != "heartbeat" && f.Type != "delta" && (f.Type != "durable" || f.Event == nil) {
+			return nil, fmt.Errorf("daemon event stream returned an invalid frame type")
 		}
 		return &f, nil
 	}

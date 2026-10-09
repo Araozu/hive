@@ -7,15 +7,13 @@ package config
 import (
 	"bufio"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-const (
-	DefaultDaemonURL = "http://127.0.0.1:7331"
-	SlopEnvPath      = "/home/aimaster/projects/slopconductor/.env"
-)
+const DefaultDaemonURL = "http://127.0.0.1:7331"
 
 // Config is the resolved hive runtime configuration.
 type Config struct {
@@ -50,7 +48,12 @@ func ResolveGoKey() (string, string) {
 	if v := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEY")); v != "" {
 		return v, "env:OPENCODE_GO_API_KEY"
 	}
-	f, err := os.Open(SlopEnvPath)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", ""
+	}
+	path := filepath.Join(home, "projects/slopconductor/.env")
+	f, err := os.Open(path)
 	if err != nil {
 		return "", ""
 	}
@@ -67,7 +70,7 @@ func ResolveGoKey() (string, string) {
 			v := strings.TrimSpace(line[i+1:])
 			v = strings.Trim(v, `"'`)
 			if k == "OPENCODE_GO_API_KEY" && v != "" {
-				return v, "file:" + SlopEnvPath
+				return v, "file:" + path
 			}
 		}
 	}
@@ -88,21 +91,11 @@ func DefaultTokenFile() string {
 
 // IsLoopback reports whether an endpoint URL targets localhost/loopback.
 func IsLoopback(endpoint string) bool {
-	rest := endpoint
-	if i := strings.Index(rest, "://"); i >= 0 {
-		rest = rest[i+3:]
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
+		return false
 	}
-	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
-		rest = rest[:i]
-	}
-	host := rest
-	if strings.HasPrefix(host, "[") {
-		if i := strings.Index(host, "]"); i >= 0 {
-			host = host[1:i]
-		}
-	} else if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
-	}
+	host := u.Hostname()
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
@@ -115,7 +108,7 @@ func IsLoopback(endpoint string) bool {
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
-			return v
+			return strings.TrimSpace(v)
 		}
 	}
 	return ""

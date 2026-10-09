@@ -36,4 +36,28 @@ password field and is only sent via `PUT /v1/providers/{id}/api-key`.
 `1-7` tabs · `tab` cycle · `r` refresh · `enter` run/show/send · `c` new
 session · `e` edit · `f` follow · `x` cancel · `d` download artifact ·
 `l`/`L` codex login/status · `g` live models · `s` stream toggle ·
-`[`/`]` focus cycle · `esc` blur · `?` help · `q`/`ctrl+c` quit.
+`[`/`]` focus cycle · `F1`/`F2`/`F3` select an input · `esc` blur ·
+`pgup`/`pgdown` scroll · `home`/`end` first/last page · `?` help ·
+`q`/`ctrl+c` quit.
+
+`tab` and `shift+tab` switch tabs even while editing. Letter and number
+shortcuts apply after `esc` blurs the input; `e` resumes editing. In Chat,
+`F1` selects the session and `F2` selects the message. In Providers, `F1`,
+`F2`, and `F3` select the provider, password, and login ID. Enter in the
+login field checks login status. `alt+enter` inserts a newline in a prompt.
+
+Failed sends retain the draft and any newly created session. Event observers
+close when changing sessions or quitting, while daemon work continues.
+Committed snapshots reconcile the chat history, including paginated history;
+`f` reconnects a closed observer. Direct provider responses require an explicit
+terminal outcome; incomplete or malformed streams never report completion.
+
+## Check
+
+```sh
+go test -race ./...
+go vet ./...
+go build ./...
+```
+
+Regression tests use local HTTP fixtures and do not require provider credentials.
