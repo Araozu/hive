@@ -1,0 +1,4 @@
+hive/
+*.log
+*.bin
+.DS_Store
