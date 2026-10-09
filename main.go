@@ -95,7 +95,7 @@ func smokeDaemon(cfg config.Config) int {
 	if err != nil {
 		return fail("capabilities: %v", err)
 	}
-	fmt.Printf("capabilities ok: tools=%d\n", len(cp.Tools))
+	fmt.Printf("capabilities ok: tools=%d steering=%t pause-resume=%t\n", len(cp.Tools), cp.ExecutionSteering, cp.TurnPauseResume)
 	pv, err := c.Providers()
 	if err != nil {
 		return fail("providers: %v", err)
@@ -106,6 +106,13 @@ func smokeDaemon(cfg config.Config) int {
 		return fail("sessions: %v", err)
 	}
 	fmt.Printf("sessions ok: %d listed\n", len(ss.Items))
+	if len(ss.Items) > 0 {
+		ins, err := c.SteeringInstructions(ss.Items[0].ID, nil, u32p(5))
+		if err != nil {
+			return fail("instructions: %v", err)
+		}
+		fmt.Printf("instructions ok: %d listed\n", len(ins.Items))
+	}
 	fmt.Println("SMOKE-OK: daemon read surface")
 	return 0
 }

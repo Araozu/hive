@@ -31,6 +31,8 @@ func testDaemon(t *testing.T, handler http.HandlerFunc) *DaemonClient {
 	return c
 }
 
+func u32p(v uint32) *uint32 { return &v }
+
 func TestEventCancellationUnblocksReaderAndClosesConnection(t *testing.T) {
 	disconnected := make(chan struct{})
 	c := testDaemon(t, func(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +134,60 @@ func TestHealthDoesNotFollowRedirect(t *testing.T) {
 	}
 	if _, err := c.Health(); err == nil {
 		t.Fatal("accepted identity supplied by redirected origin")
+	}
+}
+
+func TestTurnPauseResumeAndSteeringRoutes(t *testing.T) {
+	var routes []string
+	c := testDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		routes = append(routes, r.Method+" "+r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pause") || strings.HasSuffix(r.URL.Path, "/resume"):
+			var req TurnControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CommandID == "" {
+				t.Errorf("invalid turn control body: %v", req)
+			}
+			_ = json.NewEncoder(w).Encode(CommandReceipt{SessionID: "session"})
+		case strings.HasSuffix(r.URL.Path, "/instructions"):
+			_ = json.NewEncoder(w).Encode(Page[SteeringInstruction]{Items: []SteeringInstruction{{ID: "ins", TurnID: "turn", Delivery: DeliveryNextBoundary, Status: "accepted"}}})
+		default:
+			t.Errorf("unexpected route %s", r.URL.Path)
+		}
+	})
+	if _, err := c.PauseTurn("turn-1", &TurnControlRequest{CommandID: "cmd"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ResumeTurn("turn-1", &TurnControlRequest{CommandID: "cmd"}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := c.SteeringInstructions("session-1", nil, u32p(32))
+	if err != nil || len(p.Items) != 1 || p.Items[0].Delivery != DeliveryNextBoundary {
+		t.Fatalf("instructions = %v, %v", p, err)
+	}
+	want := []string{"POST /v1/turns/turn-1/pause", "POST /v1/turns/turn-1/resume", "GET /v1/sessions/session-1/instructions"}
+	if fmt.Sprint(routes) != fmt.Sprint(want) {
+		t.Fatalf("routes = %v, want %v", routes, want)
+	}
+}
+
+func TestSendMessageCarriesDeliveryAndModelOverride(t *testing.T) {
+	c := testDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("invalid send body: %v", err)
+		}
+		if req.Delivery == nil || *req.Delivery != DeliveryImmediate {
+			t.Errorf("delivery = %v, want immediate", req.Delivery)
+		}
+		if req.Model == nil || *req.Model != "opencode-zen/model-x" {
+			t.Errorf("model = %v, want override", req.Model)
+		}
+		_ = json.NewEncoder(w).Encode(CommandReceipt{SessionID: "session"})
+	})
+	d := DeliveryImmediate
+	model := "opencode-zen/model-x"
+	if _, err := c.SendMessage("session-1", &SendMessageRequest{CommandID: "cmd", Text: "stop", Delivery: &d, Model: &model}); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -23,22 +23,23 @@ password field and is only sent via `PUT /v1/providers/{id}/api-key`.
 
 | Tab | Covers |
 | --- | ------ |
-| Status | `GET /v1/health` (anon, version check), `GET /v1/node`, `GET /v1/models`, `GET /v1/capabilities`, `GET /v1/providers` |
-| Sessions | `GET /v1/sessions`, `GET /v1/sessions/{id}`, `POST /v1/sessions` (new command ID per mutation), history preview |
-| Chat | `POST /v1/sessions/{id}/messages` + `GET /v1/sessions/{id}/events?after=&follow=` NDJSON (durable/delta/heartbeat), canonical history reconcile |
-| Turns | `GET /v1/turns/{id}`, `POST /v1/turns/{id}/cancel`, `GET /v1/turns/{id}/requests`, `GET /v1/turns/{id}/tools`, `GET /v1/messages/{id}`, `GET /v1/tools/{id}` |
+| Status | `GET /v1/health` (anon, version check), `GET /v1/node`, `GET /v1/models`, `GET /v1/capabilities` (incl. `execution_steering`, `turn_pause_resume`), `GET /v1/providers` |
+| Sessions | `GET /v1/sessions`, `GET /v1/sessions/{id}`, `POST /v1/sessions` (new command ID per mutation) with a provider/model picker (`M` cycles ready daemon models), history preview |
+| Chat | `POST /v1/sessions/{id}/messages` with model override + `after-turn`/`next-boundary`/`immediate` delivery and `GET /v1/sessions/{id}/events?after=&follow=` NDJSON (durable/delta/heartbeat), canonical history reconcile, `GET .../instructions` steering list |
+| Turns | `GET /v1/turns/{id}`, `POST /v1/turns/{id}/cancel`, `POST /v1/turns/{id}/pause`, `POST /v1/turns/{id}/resume`, `GET /v1/turns/{id}/requests`, `GET /v1/turns/{id}/tools`, `GET /v1/messages/{id}`, `GET /v1/tools/{id}` |
 | Artifacts | `GET /v1/artifacts/{id}`, `GET /v1/artifacts/{id}/content` with size+SHA-256 verification before publish |
-| Providers | `GET /v1/providers`, `PUT /v1/providers/{p}/api-key`, `POST /v1/providers/codex/login`, `GET /v1/providers/codex/login/{id}` |
+| Providers | `GET /v1/providers`, `PUT /v1/providers/{p}/api-key` (`opencode-go`, `opencode-zen`, `codex`), `POST /v1/providers/codex/login`, `GET /v1/providers/codex/login/{id}` |
 | GoDirect | direct `GET /models` + `POST /chat/completions`, `/responses`, `/messages` (stream + non-stream) across the 32-model catalog |
 
 ## Keys
 
 `1-7` tabs · `tab` cycle · `r` refresh · `enter` run/show/send · `c` new
-session · `e` edit · `f` follow · `x` cancel · `d` download artifact ·
-`l`/`L` codex login/status · `g` live models · `s` stream toggle ·
-`[`/`]` focus cycle · `F1`/`F2`/`F3` select an input · `esc` blur ·
-`pgup`/`pgdown` scroll · `home`/`end` first/last page · `?` help ·
-`q`/`ctrl+c` quit.
+session (uses the picked model) · `o` delivery mode · `M` model override ·
+`I`/`N` steering instructions · `z`/`Z` pause/resume · `e` edit · `f` follow ·
+`x` cancel · `d` download artifact · `l`/`L` codex login/status ·
+`g` live models · `s` stream toggle · `[`/`]` focus cycle ·
+`F1`/`F2`/`F3` select an input · `esc` blur · `pgup`/`pgdown` scroll ·
+`home`/`end` first/last page · `?` help · `q`/`ctrl+c` quit.
 
 `tab` and `shift+tab` switch tabs even while editing. Letter and number
 shortcuts apply after `esc` blurs the input; `e` resumes editing. In Chat,
@@ -48,8 +49,11 @@ login field checks login status. `alt+enter` inserts a newline in a prompt.
 
 Failed sends retain the draft and any newly created session. Event observers
 close when changing sessions or quitting, while daemon work continues.
-Committed snapshots reconcile the chat history, including paginated history;
-`f` reconnects a closed observer. Direct provider responses require an explicit
+After-turn sends are blocked while a turn is active; `next-boundary` and
+`immediate` sends steer the active (or paused) turn instead. Paused turns stay
+owned until resumed, cancelled, or completed — quitting the TUI never resumes
+or cancels them. Committed snapshots reconcile the chat history, including
+paginated history; `f` reconnects a closed observer. Direct provider responses require an explicit
 terminal outcome; incomplete or malformed streams never report completion.
 
 ## Check

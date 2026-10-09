@@ -196,6 +196,14 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 		case "c":
 			*cmds = append(*cmds, m.cmdSessionCreate())
 			return true
+		case "m", "M":
+			step := 1
+			if key == "M" {
+				step = -1
+			}
+			// Session creation uses the picked model override.
+			m.cycleChatModel(step)
+			return true
 		}
 	case TabChat:
 		switch key {
@@ -204,6 +212,15 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			return true
 		case "enter":
 			m.focusInput(1, cmds)
+			return true
+		case "o", "O":
+			m.cycleDelivery()
+			return true
+		case "M":
+			m.cycleChatModel(1)
+			return true
+		case "I":
+			*cmds = append(*cmds, m.cmdSteering())
 			return true
 		case "f":
 			sid := m.chatSession.Value()
@@ -221,6 +238,15 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			return true
 		case "x", "X":
 			*cmds = append(*cmds, m.cmdTurnCancel())
+			return true
+		case "z":
+			*cmds = append(*cmds, m.cmdTurnPause())
+			return true
+		case "Z":
+			*cmds = append(*cmds, m.cmdTurnResume())
+			return true
+		case "N":
+			*cmds = append(*cmds, m.cmdSteering())
 			return true
 		case "p", "P":
 			*cmds = append(*cmds, m.cmdTurnRequests())
@@ -416,7 +442,7 @@ func (m Model) cmdSessionInspect() tea.Cmd {
 
 func (m Model) cmdSessionCreate() tea.Cmd {
 	return func() tea.Msg {
-		prov, model, err := m.defaultModel()
+		prov, model, err := m.selectedSessionModel()
 		if err != nil {
 			return errMsg{err}
 		}
@@ -451,14 +477,17 @@ func (m Model) defaultModel() (string, string, error) {
 // ---- chat ----
 
 func (m *Model) cmdChatSend(text string) tea.Cmd {
-	if m.chatSending || m.chatActive {
+	steering := m.delivery == client.DeliveryNextBoundary || m.delivery == client.DeliveryImmediate
+	if m.chatSending || (m.chatActive && !steering) {
 		return func() tea.Msg {
-			return statusMsg{"a turn is already pending; wait for completion or cancel it in Turns"}
+			return statusMsg{"a turn is already pending; pick next-boundary/immediate delivery (o) to steer it, or cancel it in Turns"}
 		}
 	}
 	m.chatSending = true
 	daemon, sid := m.daemon, strings.TrimSpace(m.chatSession.Value())
-	prov, model, _ := m.defaultModel()
+	prov, model, _ := m.selectedSessionModel()
+	delivery := m.delivery
+	override := strings.TrimSpace(m.chatModel)
 	return func() tea.Msg {
 		if sid == "" {
 			cmdID, err := client.NewCommandID()
@@ -479,11 +508,36 @@ func (m *Model) cmdChatSend(text string) tea.Cmd {
 		if err != nil {
 			return receiptMsg{err: err, text: text, session: sid}
 		}
-		r, err := daemon.SendMessage(sid, &client.SendMessageRequest{
+		req := &client.SendMessageRequest{
 			CommandID: cmdID,
 			Text:      text,
-		})
+			Delivery:  &delivery,
+		}
+		if override != "" {
+			req.Model = &override
+		}
+		r, err := daemon.SendMessage(sid, req)
 		return receiptMsg{r: r, err: err, text: text, session: sid}
+	}
+}
+
+func (m Model) cmdSteering() tea.Cmd {
+	return func() tea.Msg {
+		sid := strings.TrimSpace(m.chatSession.Value())
+		if sid == "" {
+			sid = m.chatID
+		}
+		if sid == "" && m.turnDetail != nil {
+			sid = m.turnDetail.SessionID
+		}
+		if sid == "" {
+			return statusMsg{"enter a session id first"}
+		}
+		p, err := m.daemon.SteeringInstructions(sid, nil, u32p(32))
+		if err != nil {
+			return steeringMsg{session: sid, err: err}
+		}
+		return steeringMsg{session: sid, items: p.Items}
 	}
 }
 
@@ -525,6 +579,44 @@ func (m Model) cmdTurnCancel() tea.Cmd {
 			return errMsg{err}
 		}
 		return statusMsg{"cancel accepted for " + id + " rev " + fmt.Sprint(r.Revision)}
+	}
+}
+
+func (m Model) turnControlID() string {
+	id := strings.TrimSpace(m.turnInput.Value())
+	if id == "" {
+		id = m.chatTurn
+	}
+	return id
+}
+
+func (m Model) cmdTurnPause() tea.Cmd {
+	return func() tea.Msg {
+		id := m.turnControlID()
+		if id == "" {
+			return statusMsg{"nothing to pause"}
+		}
+		cmdID, err := client.NewCommandID()
+		if err != nil {
+			return turnCtlMsg{action: "pause", err: err}
+		}
+		r, err := m.daemon.PauseTurn(id, &client.TurnControlRequest{CommandID: cmdID})
+		return turnCtlMsg{action: "pause", r: r, err: err}
+	}
+}
+
+func (m Model) cmdTurnResume() tea.Cmd {
+	return func() tea.Msg {
+		id := m.turnControlID()
+		if id == "" {
+			return statusMsg{"nothing to resume"}
+		}
+		cmdID, err := client.NewCommandID()
+		if err != nil {
+			return turnCtlMsg{action: "resume", err: err}
+		}
+		r, err := m.daemon.ResumeTurn(id, &client.TurnControlRequest{CommandID: cmdID})
+		return turnCtlMsg{action: "resume", r: r, err: err}
 	}
 }
 

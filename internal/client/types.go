@@ -72,8 +72,31 @@ type SendMessageRequest struct {
 	CommandID        string              `json:"command_id"`
 	Text             string              `json:"text"`
 	ExpectedRevision *uint64             `json:"expected_revision,omitempty"`
+	Delivery         *DeliveryMode       `json:"delivery,omitempty"`
 	Model            *string             `json:"model,omitempty"`
 	Settings         *GenerationSettings `json:"settings,omitempty"`
+}
+
+// DeliveryMode mirrors slop-protocol chat delivery (kebab-case).
+type DeliveryMode string
+
+const (
+	DeliveryAfterTurn    DeliveryMode = "after-turn"
+	DeliveryNextBoundary DeliveryMode = "next-boundary"
+	DeliveryImmediate    DeliveryMode = "immediate"
+)
+
+type SteeringInstruction struct {
+	ID        string       `json:"id"`
+	TurnID    string       `json:"turn_id"`
+	Text      string       `json:"text"`
+	Delivery  DeliveryMode `json:"delivery"`
+	Status    string       `json:"status"`
+	ErrorCode *string      `json:"error_code,omitempty"`
+}
+
+type TurnControlRequest struct {
+	CommandID string `json:"command_id"`
 }
 
 type CancelTurnRequest struct {
@@ -198,6 +221,8 @@ type CapabilitiesResponse struct {
 	Tools                 []ToolDescriptor `json:"tools"`
 	MaxModelRequests      uint32           `json:"max_model_requests_per_turn"`
 	MaxToolCalls          uint32           `json:"max_tool_calls_per_turn"`
+	ExecutionSteering     bool             `json:"execution_steering"`
+	TurnPauseResume       bool             `json:"turn_pause_resume"`
 }
 
 type ModelRequestResponse struct {

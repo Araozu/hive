@@ -361,6 +361,30 @@ func (c *DaemonClient) CancelTurn(id string, req *CancelTurnRequest) (*CommandRe
 	return &r, c.mutateJSON("POST", "/v1/turns/"+id+"/cancel", req, &r)
 }
 
+func (c *DaemonClient) PauseTurn(id string, req *TurnControlRequest) (*CommandReceipt, error) {
+	if err := checkID(id); err != nil {
+		return nil, err
+	}
+	var r CommandReceipt
+	return &r, c.mutateJSON("POST", "/v1/turns/"+id+"/pause", req, &r)
+}
+
+func (c *DaemonClient) ResumeTurn(id string, req *TurnControlRequest) (*CommandReceipt, error) {
+	if err := checkID(id); err != nil {
+		return nil, err
+	}
+	var r CommandReceipt
+	return &r, c.mutateJSON("POST", "/v1/turns/"+id+"/resume", req, &r)
+}
+
+func (c *DaemonClient) SteeringInstructions(session string, after *uint64, limit *uint32) (*Page[SteeringInstruction], error) {
+	if err := checkID(session); err != nil {
+		return nil, err
+	}
+	var p Page[SteeringInstruction]
+	return &p, c.getJSON("/v1/sessions/"+session+"/instructions"+pageQuery(after, limit), &p)
+}
+
 func (c *DaemonClient) ModelRequests(turn string, after *uint64, limit *uint32) (*Page[ModelRequestResponse], error) {
 	if err := checkID(turn); err != nil {
 		return nil, err

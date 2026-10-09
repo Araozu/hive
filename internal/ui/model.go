@@ -124,6 +124,16 @@ type (
 		s   *client.LoginStatus
 		err error
 	}
+	steeringMsg struct {
+		session string
+		items   []client.SteeringInstruction
+		err     error
+	}
+	turnCtlMsg struct {
+		action string
+		r      *client.CommandReceipt
+		err    error
+	}
 	setKeyMsg struct {
 		s   *client.ProviderStatus
 		err error
@@ -176,9 +186,14 @@ type Model struct {
 	chatText           string
 	chatChunks         map[string]uint64
 	chatCompleted      map[string]bool
-	followCh           chan followResult
-	followCtx          context.CancelFunc
-	following          bool
+	// provider/model override (full "provider/model" ref, "" = session default)
+	// plus the daemon delivery mode for the next send.
+	chatModel  string
+	delivery   client.DeliveryMode
+	steering   []client.SteeringInstruction
+	followCh   chan followResult
+	followCtx  context.CancelFunc
+	following  bool
 
 	// turns
 	turnInput  textinput.Model
@@ -255,11 +270,12 @@ func New(cfg config.Config) (Model, error) {
 		chatSession:  ti("session id (empty = create new)"),
 		turnInput:    ti("turn id"),
 		artInput:     ti("artifact id (sha256)"),
-		keyProvider:  ti("provider: opencode-go"),
+		keyProvider:  ti("provider: opencode-go | opencode-zen | codex"),
 		keyValue:     ti("api key (input hidden on screen log)"),
 		loginID:      ti("login id"),
 		inspectInput: ti("message id / tool id"),
 		goCh:         make(chan string, 256),
+		delivery:     client.DeliveryAfterTurn,
 	}
 	m.chatBox = ta("Type a message, Enter to send (Esc blurs first)")
 	m.goPrompt = ta("Direct provider prompt — Enter runs")
@@ -397,7 +413,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "session " + msg.s.ID
 			m.selectChat(msg.s.ID)
 			m.chatCursor = msg.s.LastEventSeq
-			cmds = append(cmds, m.cmdHistory())
+			cmds = append(cmds, m.cmdHistory(), m.cmdSteering())
 		}
 		return m, tea.Batch(cmds...)
 	case historyMsg:
@@ -440,7 +456,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.chatActive = true
 				m.startFollow(m.chatID, m.chatCursor)
 			}
-			cmds = append(cmds, m.cmdHistory())
+			cmds = append(cmds, m.cmdHistory(), m.cmdSteering())
 		}
 		return m, tea.Batch(cmds...)
 	case sessionCreatedMsg:
@@ -520,6 +536,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "login " + msg.s.LoginID + ": " + msg.s.Status
 		}
 		return m, nil
+	case steeringMsg:
+		if msg.err != nil {
+			m.status = "instructions: " + msg.err.Error()
+		} else if msg.session == m.chatID {
+			m.steering = msg.items
+			m.status = fmt.Sprintf("instructions: %d listed", len(msg.items))
+		}
+		return m, nil
+	case turnCtlMsg:
+		if msg.err != nil {
+			m.status = msg.action + ": " + msg.err.Error()
+		} else if msg.r != nil {
+			m.status = fmt.Sprintf("%s accepted rev %d evt %d", msg.action, msg.r.Revision, msg.r.EventSequence)
+			cmds = append(cmds, m.cmdTurnShow())
+		}
+		return m, tea.Batch(cmds...)
 	case setKeyMsg:
 		if msg.err != nil {
 			m.status = "set-key: " + msg.err.Error()
@@ -632,6 +664,85 @@ func shortID(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// statusForTurnEvent renders durable steering/pause events with their turn.
+func statusForTurnEvent(e *client.EventResponse) string {
+	if e.TurnID != nil && *e.TurnID != "" {
+		return e.Kind + " " + shortID(*e.TurnID)
+	}
+	return e.Kind
+}
+
+// cycleDelivery moves after-turn -> next-boundary -> immediate.
+func (m *Model) cycleDelivery() {
+	switch m.delivery {
+	case client.DeliveryAfterTurn:
+		m.delivery = client.DeliveryNextBoundary
+	case client.DeliveryNextBoundary:
+		m.delivery = client.DeliveryImmediate
+	default:
+		m.delivery = client.DeliveryAfterTurn
+	}
+	m.status = "delivery: " + string(m.delivery)
+}
+
+// readyModelIDs lists full "provider/model" refs for models with credentials.
+func (m *Model) readyModelIDs() []string {
+	var ids []string
+	for _, mo := range m.models {
+		if mo.Ready {
+			ids = append(ids, mo.ID)
+		}
+	}
+	return ids
+}
+
+// cycleChatModel steps the send/session override through session-default +
+// every ready daemon model. Empty means the session default.
+func (m *Model) cycleChatModel(step int) {
+	ids := m.readyModelIDs()
+	if len(ids) == 0 {
+		m.chatModel = ""
+		m.status = "model: session default (no ready models listed yet)"
+		return
+	}
+	idx := -1
+	for i, id := range ids {
+		if id == m.chatModel {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + step + len(ids) + 1) % (len(ids) + 1)
+	if idx == len(ids) {
+		m.chatModel = ""
+		m.status = "model: session default"
+	} else {
+		m.chatModel = ids[idx]
+		m.status = "model: " + m.chatModel
+	}
+}
+
+// splitModelRef splits a full "provider/model" ref for session creation.
+func splitModelRef(ref string) (string, string, bool) {
+	prov, model, ok := strings.Cut(ref, "/")
+	if !ok || prov == "" || model == "" || strings.Contains(model, "/") {
+		return "", "", false
+	}
+	return prov, model, true
+}
+
+// selectedSessionModel resolves the provider/model pair used when the TUI
+// creates a session: the picked override, else the daemon default.
+func (m Model) selectedSessionModel() (string, string, error) {
+	if m.chatModel != "" {
+		if prov, model, ok := splitModelRef(m.chatModel); ok {
+			return prov, model, nil
+		}
+		return "", "", fmt.Errorf("invalid model override %q", m.chatModel)
+	}
+	return m.defaultModel()
 }
 
 func max(a, b int) int {
@@ -786,6 +897,23 @@ func (m *Model) applyFrame(f *client.EventFrame) tea.Cmd {
 			}
 			m.status = f.Event.Kind
 			return m.cmdHistory()
+		case "turn_paused":
+			m.chatActive = true
+			m.status = statusForTurnEvent(f.Event)
+			return m.cmdHistory()
+		case "turn_resumed", "turn_steering_yielded", "turn_pause_requested":
+			m.chatActive = true
+			m.status = statusForTurnEvent(f.Event)
+			if f.Event.Kind == "turn_resumed" {
+				return m.cmdHistory()
+			}
+			return nil
+		case "steering_instruction_accepted", "steering_instruction_applied", "steering_instruction_rejected":
+			m.status = statusForTurnEvent(f.Event)
+			if f.Event.Kind == "steering_instruction_applied" {
+				return tea.Batch(m.cmdHistory(), m.cmdSteering())
+			}
+			return m.cmdSteering()
 		case "assistant_message_completed", "assistant_message_checkpointed":
 			return m.cmdHistory()
 		}
@@ -904,7 +1032,7 @@ func (m Model) View() string {
 	sb.WriteString("\n" + strings.Repeat("─", max(1, m.w-2)) + "\n")
 	sb.WriteString(dimStyle.Render("status: ") + m.status + "\n")
 	if m.showHelp {
-		sb.WriteString(dimStyle.Render("keys: 1-7 tabs · tab cycle · r refresh · enter run/send · c new session · esc blur · s stream toggle (GoDirect) · q quit · ? help") + "\n")
+		sb.WriteString(dimStyle.Render("keys: 1-7 tabs · tab cycle · r refresh · enter run/send · c new session · o delivery · M model · I/N instructions · z/Z pause/resume · x cancel · esc blur · s stream (GoDirect) · q quit · ? help") + "\n")
 	} else {
 		sb.WriteString(dimStyle.Render("? help · pgup/pgdown scroll · q quit") + "\n")
 	}
@@ -985,6 +1113,8 @@ func (m Model) viewStatus() string {
 	if m.caps != nil {
 		sb.WriteString(fmt.Sprintf("structured: msgs=%t per-turn-model=%t per-turn-settings=%t tools=%d\n",
 			m.caps.StructuredMessages, m.caps.PerTurnModelSelection, m.caps.PerTurnSettings, len(m.caps.Tools)))
+		sb.WriteString(fmt.Sprintf("steering: execution-steering=%t turn-pause-resume=%t\n",
+			m.caps.ExecutionSteering, m.caps.TurnPauseResume))
 		for _, t := range m.caps.Tools {
 			sb.WriteString(fmt.Sprintf(" - %-12s [%s] %s\n", t.Name, t.SideEffects, t.Description))
 		}
@@ -1001,7 +1131,8 @@ func (m Model) viewStatus() string {
 
 func (m Model) viewSessions() string {
 	var sb strings.Builder
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("%d sessions (j/k or ↑/↓, enter inspect, c new, r refresh)", len(m.sessions))) + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("%d sessions (j/k or ↑/↓, enter inspect, c new, r refresh, M model)", len(m.sessions))) + "\n")
+	sb.WriteString(dimStyle.Render("new sessions use model: "+m.modelLabel()) + "\n")
 	for i, s := range m.sessions {
 		cursor := "  "
 		if i == m.sessCursor {
@@ -1011,7 +1142,7 @@ func (m Model) viewSessions() string {
 		if s.Title != nil {
 			title = *s.Title
 		}
-		sb.WriteString(fmt.Sprintf("%s%s %s rev=%d evt=%d %s\n", cursor, s.ID, s.Model, s.Revision, s.LastEventSeq, title))
+		sb.WriteString(fmt.Sprintf("%s%s %s/%s rev=%d evt=%d %s\n", cursor, s.ID, s.Provider, s.Model, s.Revision, s.LastEventSeq, title))
 	}
 	if m.sessDetail != nil {
 		sb.WriteString(fmt.Sprintf("\nselected: %s provider=%s model=%s rev=%d evt=%d\n",
@@ -1029,6 +1160,7 @@ func (m Model) viewSessions() string {
 func (m Model) viewChat() string {
 	var sb strings.Builder
 	sb.WriteString("session: " + m.chatSession.View() + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("model %s · delivery %s", m.modelLabel(), m.delivery)) + "\n")
 	if m.chatTurn != "" {
 		state := "running"
 		if !m.chatActive {
@@ -1041,9 +1173,22 @@ func (m Model) viewChat() string {
 		sb.WriteString(m.chatBox.View() + "\n")
 		sb.WriteString(dimStyle.Render("enter send · esc blur") + "\n")
 	} else {
-		sb.WriteString(dimStyle.Render("e edit message · enter send (when session set or new) · f follow stream") + "\n")
+		sb.WriteString(dimStyle.Render("e edit · enter send · o delivery · M model · I instructions · f follow") + "\n")
+	}
+	if len(m.steering) > 0 {
+		sb.WriteString(dimStyle.Render("steering:") + "\n")
+		for _, ins := range m.steering {
+			sb.WriteString(fmt.Sprintf(" %s %s %s %s\n", shortID(ins.ID), ins.Delivery, ins.Status, truncate(ins.Text, 100)))
+		}
 	}
 	return sb.String()
+}
+
+func (m Model) modelLabel() string {
+	if m.chatModel != "" {
+		return m.chatModel
+	}
+	return "(session default)"
 }
 
 func (m Model) viewTurns() string {
@@ -1085,7 +1230,13 @@ func (m Model) viewTurns() string {
 	if m.singleMsg != nil {
 		sb.WriteString(fmt.Sprintf("message %s [%s]: %s\n", m.singleMsg.ID, m.singleMsg.Role, truncate(m.singleMsg.Text, 300)))
 	}
-	sb.WriteString(dimStyle.Render("enter show turn · x cancel · p requests · t tools · m message · i tool · F1/F2 focus") + "\n")
+	if len(m.steering) > 0 {
+		sb.WriteString(dimStyle.Render("steering instructions:") + "\n")
+		for _, ins := range m.steering {
+			sb.WriteString(fmt.Sprintf(" %s %s %s %s\n", shortID(ins.ID), ins.Delivery, ins.Status, truncate(ins.Text, 100)))
+		}
+	}
+	sb.WriteString(dimStyle.Render("enter show turn · x cancel · z pause · Z resume · p requests · t tools · m message · i tool · N instructions · F1/F2 focus") + "\n")
 	return sb.String()
 }
 

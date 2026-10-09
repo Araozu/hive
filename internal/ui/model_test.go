@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -236,6 +237,100 @@ func TestHistoryFollowsPagination(t *testing.T) {
 	m, _ = updateModel(m, m.cmdHistory()())
 	if len(m.history) != 2 || !strings.Contains(m.chatText, "latest") {
 		t.Fatal("history stopped at first page")
+	}
+}
+
+func TestDeliveryAndModelSelection(t *testing.T) {
+	m := testModel(t, nil)
+	if m.delivery != client.DeliveryAfterTurn {
+		t.Fatalf("default delivery = %q", m.delivery)
+	}
+	m.cycleDelivery()
+	if m.delivery != client.DeliveryNextBoundary {
+		t.Fatalf("delivery = %q", m.delivery)
+	}
+	m.cycleDelivery()
+	m.cycleDelivery()
+	if m.delivery != client.DeliveryAfterTurn {
+		t.Fatalf("delivery did not wrap: %q", m.delivery)
+	}
+	m.models = []client.ModelResponse{
+		{ID: "opencode-go/a", Provider: "opencode-go", Model: "a", Ready: true},
+		{ID: "opencode-zen/b", Provider: "opencode-zen", Model: "b", Ready: true},
+		{ID: "codex/c", Provider: "codex", Model: "c", Ready: false},
+	}
+	m.cycleChatModel(1)
+	if m.chatModel != "opencode-go/a" {
+		t.Fatalf("model = %q", m.chatModel)
+	}
+	m.cycleChatModel(1)
+	m.cycleChatModel(1)
+	if m.chatModel != "" {
+		t.Fatalf("model did not wrap to default: %q", m.chatModel)
+	}
+	prov, model, err := m.selectedSessionModel()
+	if err != nil || prov == "" || model == "" {
+		t.Fatalf("default session model = %q/%q, %v", prov, model, err)
+	}
+	m.chatModel = "opencode-zen/b"
+	if prov, model, err := m.selectedSessionModel(); err != nil || prov != "opencode-zen" || model != "b" {
+		t.Fatalf("override session model = %q/%q, %v", prov, model, err)
+	}
+}
+
+func TestSteeringSendAllowedWhileTurnActive(t *testing.T) {
+	m := testModel(t, nil)
+	m.chatActive, m.delivery = true, client.DeliveryAfterTurn
+	if msg := m.cmdChatSend("wait")(); msg == nil {
+		t.Fatal("missing guard message")
+	} else if s, ok := msg.(statusMsg); !ok || !strings.Contains(s.s, "already pending") {
+		t.Fatalf("after-turn send was not blocked: %#v", msg)
+	}
+	m.delivery = client.DeliveryImmediate
+	m.chatSending = false
+	done := make(chan struct{})
+	go func() { defer close(done); m.cmdChatSend("steer")() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering send stayed blocked while a turn was active")
+	}
+}
+
+func TestPauseResumeEventsKeepFollowing(t *testing.T) {
+	m := testModel(t, nil)
+	m.selectChat("session")
+	turn := "turn-1"
+	m.chatTurn, m.chatActive, m.chatCursor = turn, true, 7
+	paused := &client.EventFrame{Type: "durable", Event: &client.EventResponse{
+		SessionID: "session", Sequence: 8, Kind: "turn_paused", TurnID: &turn,
+	}}
+	if cmd := m.applyFrame(paused); cmd == nil {
+		t.Fatal("paused turn did not reconcile history")
+	}
+	if !m.chatActive || m.chatCursor != 8 {
+		t.Fatal("paused turn looked terminal")
+	}
+	resumed := &client.EventFrame{Type: "durable", Event: &client.EventResponse{
+		SessionID: "session", Sequence: 9, Kind: "turn_resumed", TurnID: &turn,
+	}}
+	m.applyFrame(resumed)
+	if !m.chatActive {
+		t.Fatal("resumed turn cleared activity")
+	}
+	steer := &client.EventFrame{Type: "durable", Event: &client.EventResponse{
+		SessionID: "session", Sequence: 10, Kind: "steering_instruction_applied", TurnID: &turn,
+	}}
+	if cmd := m.applyFrame(steer); cmd == nil {
+		t.Fatal("applied steering did not reconcile history")
+	}
+	m, _ = updateModel(m, turnCtlMsg{action: "pause", r: &client.CommandReceipt{Revision: 3, EventSequence: 11}})
+	if !strings.Contains(m.status, "pause accepted") {
+		t.Fatalf("pause receipt status = %q", m.status)
+	}
+	m, _ = updateModel(m, steeringMsg{session: "session", items: []client.SteeringInstruction{{ID: "ins", Delivery: client.DeliveryImmediate, Status: "applied"}}})
+	if len(m.steering) != 1 {
+		t.Fatal("steering instructions were not stored")
 	}
 }
 
