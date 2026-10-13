@@ -196,6 +196,9 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 		case "c":
 			*cmds = append(*cmds, m.cmdSessionCreate())
 			return true
+		case "C":
+			m.cycleContextPolicy()
+			return true
 		case "m", "M":
 			step := 1
 			if key == "M" {
@@ -218,6 +221,9 @@ func (m *Model) handleKey(msg tea.KeyMsg, cmds *[]tea.Cmd) bool {
 			return true
 		case "M":
 			m.cycleChatModel(1)
+			return true
+		case "C":
+			m.cycleContextPolicy()
 			return true
 		case "I":
 			*cmds = append(*cmds, m.cmdSteering())
@@ -454,6 +460,7 @@ func (m Model) cmdSessionCreate() tea.Cmd {
 			CommandID: cmdID + ":session",
 			Provider:  prov,
 			Model:     model,
+			Settings:  m.contextSettings(),
 		})
 		return sessionCreatedMsg{r, err}
 	}
@@ -488,6 +495,7 @@ func (m *Model) cmdChatSend(text string) tea.Cmd {
 	prov, model, _ := m.selectedSessionModel()
 	delivery := m.delivery
 	override := strings.TrimSpace(m.chatModel)
+	settings := m.contextSettings()
 	return func() tea.Msg {
 		if sid == "" {
 			cmdID, err := client.NewCommandID()
@@ -498,6 +506,7 @@ func (m *Model) cmdChatSend(text string) tea.Cmd {
 				CommandID: cmdID + ":session",
 				Provider:  prov,
 				Model:     model,
+				Settings:  settings,
 			})
 			if err != nil {
 				return receiptMsg{err: err, text: text}
@@ -512,6 +521,7 @@ func (m *Model) cmdChatSend(text string) tea.Cmd {
 			CommandID: cmdID,
 			Text:      text,
 			Delivery:  &delivery,
+			Settings:  settings,
 		}
 		if override != "" {
 			req.Model = &override

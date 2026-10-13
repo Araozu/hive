@@ -43,6 +43,53 @@ func testModel(t *testing.T, handler http.HandlerFunc) Model {
 	return m
 }
 
+func TestContextPolicyIsExplicitForNewSessionsAndExistingTurns(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, mode := range []string{"inherit", "full", "capped"} {
+			t.Run(fmt.Sprintf("existing=%t/%s", existing, mode), func(t *testing.T) {
+				requests := 0
+				m := testModel(t, func(w http.ResponseWriter, r *http.Request) {
+					var body struct {
+						Settings *client.GenerationSettings `json:"settings"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if mode == "inherit" {
+						if body.Settings != nil {
+							t.Error("inherited settings must be omitted")
+						}
+					} else if body.Settings == nil || body.Settings.FullContext == nil || *body.Settings.FullContext != (mode == "full") {
+						t.Errorf("context selection was lost: %+v", body.Settings)
+					}
+					requests++
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(client.CommandReceipt{SessionID: "session"})
+				})
+				m.tab = TabChat
+				if existing {
+					m.selectChat("session")
+				}
+				var cmds []tea.Cmd
+				for i := 0; i < map[string]int{"inherit": 0, "full": 1, "capped": 2}[mode]; i++ {
+					m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}}, &cmds)
+				}
+				result := m.cmdChatSend("continue")().(receiptMsg)
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				wantRequests := 2
+				if existing {
+					wantRequests = 1
+				}
+				if requests != wantRequests {
+					t.Fatalf("requests = %d, want %d", requests, wantRequests)
+				}
+			})
+		}
+	}
+}
+
 func TestLatestHistoryResponseWins(t *testing.T) {
 	m := testModel(t, nil)
 	m.selectChat("session")

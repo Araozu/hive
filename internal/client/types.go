@@ -34,6 +34,7 @@ type ErrorResponse struct {
 type GenerationSettings struct {
 	MaxOutputTokens *uint32 `json:"max_output_tokens,omitempty"`
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	FullContext     *bool   `json:"full_context,omitempty"`
 }
 
 type WorkspacePolicy struct {
@@ -190,10 +191,12 @@ type EventFrame struct {
 }
 
 type ModelCapabilities struct {
-	Tools             bool     `json:"tools"`
-	ReasoningEfforts  []string `json:"reasoning_efforts"`
-	IncrementalStream bool     `json:"incremental_streaming"`
-	MaxOutputTokens   uint32   `json:"max_output_tokens"`
+	Tools               bool     `json:"tools"`
+	ReasoningEfforts    []string `json:"reasoning_efforts"`
+	IncrementalStream   bool     `json:"incremental_streaming"`
+	MaxOutputTokens     uint32   `json:"max_output_tokens"`
+	ContextWindowTokens *uint64  `json:"context_window_tokens"`
+	MaxInputTokens      *uint64  `json:"max_input_tokens"`
 }
 
 type ModelResponse struct {

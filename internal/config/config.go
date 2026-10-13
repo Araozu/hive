@@ -22,6 +22,7 @@ type Config struct {
 	TokenAvails bool
 	GoAPIKey    string
 	GoKeySource string
+	FullContext *bool
 }
 
 // Resolve builds a Config from flags/env/defaults.

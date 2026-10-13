@@ -29,6 +29,7 @@ func main() {
 	smoke := flag.Bool("smoke-daemon", false, "headless daemon capability check (no TUI)")
 	probe := flag.Bool("probe-go", false, "headless direct opencode-go probe (list + tiny turn)")
 	showVer := flag.Bool("version", false, "print version")
+	fullContext := flag.Bool("full-context", false, "opt in to the model's full context window (default cost cap: 275k tokens)")
 	flag.Parse()
 
 	if *showVer {
@@ -36,6 +37,11 @@ func main() {
 		return
 	}
 	cfg := config.Resolve(*daemonFlag, *tokenFlag)
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "full-context" {
+			cfg.FullContext = fullContext
+		}
+	})
 
 	if *smoke {
 		os.Exit(smokeDaemon(cfg))

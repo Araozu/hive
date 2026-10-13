@@ -188,12 +188,13 @@ type Model struct {
 	chatCompleted      map[string]bool
 	// provider/model override (full "provider/model" ref, "" = session default)
 	// plus the daemon delivery mode for the next send.
-	chatModel  string
-	delivery   client.DeliveryMode
-	steering   []client.SteeringInstruction
-	followCh   chan followResult
-	followCtx  context.CancelFunc
-	following  bool
+	chatModel       string
+	chatFullContext *bool
+	delivery        client.DeliveryMode
+	steering        []client.SteeringInstruction
+	followCh        chan followResult
+	followCtx       context.CancelFunc
+	following       bool
 
 	// turns
 	turnInput  textinput.Model
@@ -266,7 +267,8 @@ func New(cfg config.Config) (Model, error) {
 	}
 	m := Model{
 		cfg: cfg, daemon: daemon, gopro: gp,
-		w: 80, h: 24,
+		chatFullContext: cfg.FullContext,
+		w:               80, h: 24,
 		chatSession:  ti("session id (empty = create new)"),
 		turnInput:    ti("turn id"),
 		artInput:     ti("artifact id (sha256)"),
@@ -1032,7 +1034,7 @@ func (m Model) View() string {
 	sb.WriteString("\n" + strings.Repeat("─", max(1, m.w-2)) + "\n")
 	sb.WriteString(dimStyle.Render("status: ") + m.status + "\n")
 	if m.showHelp {
-		sb.WriteString(dimStyle.Render("keys: 1-7 tabs · tab cycle · r refresh · enter run/send · c new session · o delivery · M model · I/N instructions · z/Z pause/resume · x cancel · esc blur · s stream (GoDirect) · q quit · ? help") + "\n")
+		sb.WriteString(dimStyle.Render("keys: 1-7 tabs · tab cycle · r refresh · enter run/send · c new session · o delivery · M model · C context · I/N instructions · z/Z pause/resume · x cancel · esc blur · s stream (GoDirect) · q quit · ? help") + "\n")
 	} else {
 		sb.WriteString(dimStyle.Render("? help · pgup/pgdown scroll · q quit") + "\n")
 	}
@@ -1132,7 +1134,7 @@ func (m Model) viewStatus() string {
 func (m Model) viewSessions() string {
 	var sb strings.Builder
 	sb.WriteString(dimStyle.Render(fmt.Sprintf("%d sessions (j/k or ↑/↓, enter inspect, c new, r refresh, M model)", len(m.sessions))) + "\n")
-	sb.WriteString(dimStyle.Render("new sessions use model: "+m.modelLabel()) + "\n")
+	sb.WriteString(dimStyle.Render("new sessions use model: "+m.modelLabel()+" · context: "+m.contextLabel()+" (C cycles)") + "\n")
 	for i, s := range m.sessions {
 		cursor := "  "
 		if i == m.sessCursor {
@@ -1160,7 +1162,7 @@ func (m Model) viewSessions() string {
 func (m Model) viewChat() string {
 	var sb strings.Builder
 	sb.WriteString("session: " + m.chatSession.View() + "\n")
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("model %s · delivery %s", m.modelLabel(), m.delivery)) + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("model %s · delivery %s · context %s", m.modelLabel(), m.delivery, m.contextLabel())) + "\n")
 	if m.chatTurn != "" {
 		state := "running"
 		if !m.chatActive {
@@ -1173,7 +1175,7 @@ func (m Model) viewChat() string {
 		sb.WriteString(m.chatBox.View() + "\n")
 		sb.WriteString(dimStyle.Render("enter send · esc blur") + "\n")
 	} else {
-		sb.WriteString(dimStyle.Render("e edit · enter send · o delivery · M model · I instructions · f follow") + "\n")
+		sb.WriteString(dimStyle.Render("e edit · enter send · o delivery · M model · C context · I instructions · f follow") + "\n")
 	}
 	if len(m.steering) > 0 {
 		sb.WriteString(dimStyle.Render("steering:") + "\n")
@@ -1189,6 +1191,37 @@ func (m Model) modelLabel() string {
 		return m.chatModel
 	}
 	return "(session default)"
+}
+
+func (m Model) contextLabel() string {
+	if m.chatFullContext == nil {
+		return "session default"
+	}
+	if *m.chatFullContext {
+		return "full model window"
+	}
+	return "cost cap (275k default)"
+}
+
+func (m Model) contextSettings() *client.GenerationSettings {
+	if m.chatFullContext == nil {
+		return nil
+	}
+	value := *m.chatFullContext
+	return &client.GenerationSettings{FullContext: &value}
+}
+
+func (m *Model) cycleContextPolicy() {
+	if m.chatFullContext == nil {
+		value := true
+		m.chatFullContext = &value
+	} else if *m.chatFullContext {
+		value := false
+		m.chatFullContext = &value
+	} else {
+		m.chatFullContext = nil
+	}
+	m.status = "context: " + m.contextLabel()
 }
 
 func (m Model) viewTurns() string {

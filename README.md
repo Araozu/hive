@@ -9,6 +9,7 @@ cancellation path, matching `slop turn cancel`.
 
 ```sh
 go run .                 # TUI (uses SLOP_DAEMON_URL / SLOP_TOKEN_FILE or loopback defaults)
+go run . --full-context  # opt in to the model's full context window
 go run . --smoke-daemon  # headless daemon read-surface check (needs daemon up)
 go run . --probe-go      # headless direct provider check (needs OPENCODE_GO_API_KEY)
 ```
@@ -34,7 +35,7 @@ password field and is only sent via `PUT /v1/providers/{id}/api-key`.
 ## Keys
 
 `1-7` tabs · `tab` cycle · `r` refresh · `enter` run/show/send · `c` new
-session (uses the picked model) · `o` delivery mode · `M` model override ·
+session (uses the picked model) · `o` delivery mode · `M` model override · `C` context policy ·
 `I`/`N` steering instructions · `z`/`Z` pause/resume · `e` edit · `f` follow ·
 `x` cancel · `d` download artifact · `l`/`L` codex login/status ·
 `g` live models · `s` stream toggle · `[`/`]` focus cycle ·
@@ -46,6 +47,13 @@ shortcuts apply after `esc` blurs the input; `e` resumes editing. In Chat,
 `F1` selects the session and `F2` selects the message. In Providers, `F1`,
 `F2`, and `F3` select the provider, password, and login ID. Enter in the
 login field checks login status. `alt+enter` inserts a newline in a prompt.
+
+In Chat and Sessions, `C` cycles session default → full model window → cost cap.
+The daemon defaults to a 275,000-token cap, clamped to smaller model limits,
+with reply headroom and automatic compaction. Full context is an explicit opt-in;
+new sessions retain it and existing sessions can override it per turn. The
+daemon owns token accounting and compaction. `--full-context=false` selects the
+cost cap even when opening a session that opted in previously.
 
 Failed sends retain the draft and any newly created session. Event observers
 close when changing sessions or quitting, while daemon work continues.
